@@ -1,0 +1,50 @@
+{
+  "version": "0.1.0",
+  "options": [
+    {
+      "key": "applyAutodriveFixes",
+      "label": "Apply Traffic and AutoDrive fixes",
+      "type": "bool",
+      "default": true,
+      "help": "Improves highway traffic spawns, highway merge and exit-ramp lane keeping, uninterrupted long-distance AutoDrive, passing, stopped-car avoidance, and live driving controls. Click Save, click Start, then restart BeamNG.Earth."
+    },
+    {
+      "key": "enableOneHotkeyReport",
+      "label": "Enable 1-hotkey driving reporter (Ctrl+Shift+T)",
+      "type": "bool",
+      "default": true,
+      "help": "Press Ctrl+Shift+T while driving to send a quick screenshot, map location, and anonymized driving/traffic snapshot without pausing."
+    },
+    {
+      "key": "notifyFixedReports",
+      "label": "Notify when my reported spots are fixed",
+      "type": "bool",
+      "default": true,
+      "help": "Shows a quiet one-time corner notice at launch when a spot you reported with Ctrl+Shift+T is fixed in an update."
+    },
+    {
+      "key": "notifyAddonUpdates",
+      "label": "Notify when an add-on update is available",
+      "type": "bool",
+      "default": true,
+      "help": "Checks once at launch for a newer release of Traffic and AutoDrive fixes and shows a quiet corner notice."
+    },
+    {
+      "key": "reportCategory",
+      "label": "Driving report category",
+      "type": "choice",
+      "default": "autodrive",
+      "choices": ["autodrive", "traffic", "overtake", "routing", "other"],
+      "help": "Default category used when pressing Ctrl+Shift+T (takes effect right away without restarting)."
+    },
+    {
+      "key": "serverAction",
+      "label": "Setup action",
+      "type": "choice",
+      "default": "Apply fixes",
+      "choices": ["Apply fixes", "Restore original app"],
+      "help": "Choose Restore original app, click Save, click Start, and restart BeamNG.Earth to uninstall."
+    }
+  ],
+  "run": {"args": []}
+}

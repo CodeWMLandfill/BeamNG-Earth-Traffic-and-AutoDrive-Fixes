@@ -63,15 +63,29 @@ def _norm_key(path):
     return s.lower() if os.name == "nt" else s
 
 
+def _is_supported_platform():
+    return (
+        os.name == "nt"
+        or sys.platform.startswith("linux")
+        or os.environ.get("BNE_ADF_ALLOW_NON_WINDOWS_TEST") == "1"
+    )
+
+
 def default_state_dir(local_appdata=None):
     override = os.environ.get("BNE_ADF_STATE_DIR")
     if override and local_appdata is None:
         return Path(override).resolve()
-    base = Path(
-        local_appdata
-        or os.environ.get("LOCALAPPDATA")
-        or (Path.home() / "AppData" / "Local")
-    )
+    if local_appdata is not None or os.name == "nt":
+        base = Path(
+            local_appdata
+            or os.environ.get("LOCALAPPDATA")
+            or (Path.home() / "AppData" / "Local")
+        )
+    else:
+        base = Path(
+            os.environ.get("XDG_STATE_HOME")
+            or (Path.home() / ".local" / "state")
+        )
     return base / "BeamNG-Earth-Autodrive-Fixes"
 
 
@@ -94,14 +108,35 @@ def _is_ignored_exe_name(name):
     lower = name.lower()
     return (
         f".{patch_server.TAG.lower()}." in lower
+        or ".earthbridgerailfixes." in lower
         or ".original" in lower
         or ".pending" in lower
         or ".swap." in lower
+        or lower.endswith(".json")
+        or lower.endswith(".sha256")
     )
 
 
+def _is_candidate_binary(path):
+    if not path.is_file() or _is_ignored_exe_name(path.name):
+        return False
+    lower = path.name.lower()
+    if lower.endswith((".exe", ".appimage")):
+        return True
+    if lower.endswith(".zip") and patch_server._is_host_zip_file(path):
+        return True
+    try:
+        with path.open("rb") as f:
+            head = f.read(64)
+        if head[:4] == b"\x7fELF" or patch_server.APPIMAGE_WRAPPER_MAGIC[:16] in head:
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def normalize_candidate_target(raw_path):
-    """Resolve raw exe/folder/shortcut-parent into a valid BeamNG.Earth target path, or None."""
+    """Resolve raw exe/AppImage/Host/folder path into a valid BeamNG.Earth target path, or None."""
     if not raw_path:
         return None
     s = str(raw_path).strip().strip('"').strip("'")
@@ -114,7 +149,7 @@ def normalize_candidate_target(raw_path):
         return None
 
     if p.is_file():
-        if p.suffix.lower() == ".exe" and not _is_ignored_exe_name(p.name):
+        if _is_candidate_binary(p):
             return p
         if p.name == "earthd.py" and p.parent.name == "server":
             cand = p.parent.parent
@@ -125,67 +160,117 @@ def normalize_candidate_target(raw_path):
     if p.is_dir():
         if (p / "server" / "earthd.py").is_file() and (p / "mod" / "beamng_earth").is_dir():
             return p
-        exes = sorted(
-            [e for e in p.glob("BeamNG.Earth*.exe") if e.is_file() and not _is_ignored_exe_name(e.name)],
+        if (p / "Resources" / "Client" / "beamng_earth.zip").is_file():
+            return p
+        bins = sorted(
+            [
+                e for pat in ("BeamNG.Earth*.exe", "BeamNG.Earth*.AppImage", "BeamNG.Earth*")
+                for e in p.glob(pat)
+                if _is_candidate_binary(e)
+            ],
             key=lambda e: e.stat().st_mtime,
             reverse=True,
         )
-        if exes:
-            return exes[0]
+        if bins:
+            return bins[0]
     return None
 
 
-def find_running_beamng_earth_processes(exclude_pid=None):
-    """Return list of (pid, exe_path) for running BeamNG.Earth*.exe processes on Windows."""
-    if os.name != "nt":
-        return []
-    exclude_pid = exclude_pid if exclude_pid is not None else os.getpid()
+def _self_exe_excluded_pids(self_exe=False, exclude_pid=None, exclude_pids=None):
+    """Build the set of own/bootloader PIDs to ignore when scanning running BeamNG.Earth instances."""
+    excluded = {int(exclude_pid) if exclude_pid else os.getpid()}
+    if exclude_pids:
+        for p in exclude_pids:
+            if p and int(p) > 0:
+                excluded.add(int(p))
+    if self_exe:
+        ppid = os.getppid()
+        if ppid and int(ppid) > 0:
+            excluded.add(int(ppid))
+        try:
+            env_parent = int(os.environ.get("BNGEARTH_PARENT") or 0)
+        except ValueError:
+            env_parent = 0
+        if env_parent > 0:
+            excluded.add(env_parent)
+    return excluded
+
+
+def find_running_beamng_earth_processes(exclude_pid=None, *, self_exe=False, exclude_pids=None):
+    """Return list of (pid, exe_path) for running BeamNG.Earth processes on Windows or Linux."""
+    excluded = _self_exe_excluded_pids(self_exe=self_exe, exclude_pid=exclude_pid, exclude_pids=exclude_pids)
     found = []
-    kw = {"capture_output": True, "text": True, "timeout": 8}
-    if hasattr(subprocess, "CREATE_NO_WINDOW"):
-        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    if os.name == "nt":
+        kw = {"capture_output": True, "text": True, "timeout": 8}
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-    ps_script = (
-        "Get-CimInstance Win32_Process -Filter \"Name LIKE 'BeamNG.Earth%.exe'\" | "
-        "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }"
-    )
-    try:
-        res = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            **kw,
+        ps_script = (
+            "Get-CimInstance Win32_Process -Filter \"Name LIKE 'BeamNG.Earth%.exe'\" | "
+            "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }"
         )
-        if res.returncode == 0 and res.stdout.strip():
-            for line in res.stdout.splitlines():
-                if "|" not in line:
-                    continue
-                pid_s, exe_path = line.split("|", 1)
-                try:
-                    pid = int(pid_s.strip())
-                except ValueError:
-                    continue
-                if pid <= 0 or pid == exclude_pid:
-                    continue
-                found.append((pid, exe_path.strip()))
-            return found
-    except (OSError, subprocess.SubprocessError):
-        pass
+        try:
+            res = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                **kw,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                for line in res.stdout.splitlines():
+                    if "|" not in line:
+                        continue
+                    pid_s, exe_path = line.split("|", 1)
+                    try:
+                        pid = int(pid_s.strip())
+                    except ValueError:
+                        continue
+                    if pid <= 0 or pid in excluded:
+                        continue
+                    found.append((pid, exe_path.strip()))
+                return found
+        except (OSError, subprocess.SubprocessError):
+            pass
 
-    try:
-        res = subprocess.run(["tasklist", "/FI", "IMAGENAME eq BeamNG.Earth*", "/FO", "CSV", "/NH"], **kw)
-        if res.returncode == 0 and res.stdout.strip():
-            for line in res.stdout.splitlines():
-                cols = [c.strip().strip('"') for c in line.split('","')]
-                if len(cols) >= 2 and cols[0].lower().startswith("beamng.earth") and cols[1].isdigit():
-                    pid = int(cols[1])
-                    if pid > 0 and pid != exclude_pid:
-                        found.append((pid, ""))
-    except (OSError, subprocess.SubprocessError):
-        pass
+        try:
+            res = subprocess.run(["tasklist", "/FI", "IMAGENAME eq BeamNG.Earth*", "/FO", "CSV", "/NH"], **kw)
+            if res.returncode == 0 and res.stdout.strip():
+                for line in res.stdout.splitlines():
+                    cols = [c.strip().strip('"') for c in line.split('","')]
+                    if len(cols) >= 2 and cols[0].lower().startswith("beamng.earth") and cols[1].isdigit():
+                        pid = int(cols[1])
+                        if pid > 0 and pid not in excluded:
+                            found.append((pid, ""))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return found
+
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid <= 0 or pid in excluded:
+                continue
+            try:
+                appimage_p = ""
+                env_raw = (entry / "environ").read_bytes()
+                for item in env_raw.split(b"\x00"):
+                    if item.startswith(b"APPIMAGE="):
+                        appimage_p = item[9:].decode("utf-8", "replace").strip()
+                        break
+                if appimage_p and Path(appimage_p).is_file():
+                    found.append((pid, str(Path(appimage_p).resolve())))
+                    continue
+                exe_p = (entry / "exe").resolve()
+                if exe_p.name.lower().startswith("beamng.earth") and "/tmp/.mount_" not in str(exe_p):
+                    found.append((pid, str(exe_p)))
+            except OSError:
+                continue
     return found
 
 
 def discover_targets(search_roots=None, state_root=None, include_running=True):
-    """Discover candidate BeamNG.Earth installations (.exe or source checkouts) in priority order."""
+    """Discover candidate BeamNG.Earth installations (.exe, .AppImage, Host, or source) in priority order."""
     candidates = []
     seen = set()
 
@@ -230,11 +315,6 @@ def discover_targets(search_roots=None, state_root=None, include_running=True):
                 pass
 
         home = Path.home()
-        local_app = Path(os.environ.get("LOCALAPPDATA") or (home / "AppData" / "Local"))
-        prog_files = os.environ.get("ProgramFiles")
-        prog_x86 = os.environ.get("ProgramFiles(x86)")
-        onedrive = os.environ.get("OneDrive")
-
         roots = [
             Path.cwd(),
             Path.cwd().parent,
@@ -242,20 +322,30 @@ def discover_targets(search_roots=None, state_root=None, include_running=True):
             ROOT.parent,
             home / "Downloads",
             home / "Desktop",
+            home / "Applications",
+            home / ".local" / "bin",
         ]
-        if onedrive:
-            roots.append(Path(onedrive) / "Desktop")
-            roots.append(Path(onedrive) / "Downloads")
-        roots.extend([
-            local_app / "Programs",
-            local_app / "Programs" / "BeamNG.Earth",
-            local_app / "beamng-earth",
-        ])
-        if prog_files:
-            roots.append(Path(prog_files))
-            roots.append(Path(prog_files) / "BeamNG.Earth")
-        if prog_x86:
-            roots.append(Path(prog_x86) / "BeamNG.Earth")
+        if os.name == "nt":
+            local_app = Path(os.environ.get("LOCALAPPDATA") or (home / "AppData" / "Local"))
+            prog_files = os.environ.get("ProgramFiles")
+            prog_x86 = os.environ.get("ProgramFiles(x86)")
+            onedrive = os.environ.get("OneDrive")
+            if onedrive:
+                roots.append(Path(onedrive) / "Desktop")
+                roots.append(Path(onedrive) / "Downloads")
+            roots.extend([
+                local_app / "Programs",
+                local_app / "Programs" / "BeamNG.Earth",
+                local_app / "beamng-earth",
+            ])
+            if prog_files:
+                roots.append(Path(prog_files))
+                roots.append(Path(prog_files) / "BeamNG.Earth")
+            if prog_x86:
+                roots.append(Path(prog_x86) / "BeamNG.Earth")
+        else:
+            cache_base = Path(os.environ.get("XDG_CACHE_HOME") or (home / ".cache"))
+            roots.append(cache_base / "beamng-earth")
 
     for folder in roots:
         try:
@@ -269,20 +359,22 @@ def discover_targets(search_roots=None, state_root=None, include_running=True):
             continue
 
         _add(folder)
-        try:
-            for exe in sorted(folder.glob("BeamNG.Earth*.exe"), key=lambda p: p.stat().st_mtime, reverse=True):
-                if exe.is_file() and not _is_ignored_exe_name(exe.name):
-                    _add(exe)
-        except OSError:
-            pass
+        for pat in ("BeamNG.Earth*.exe", "BeamNG.Earth*.AppImage"):
+            try:
+                for bin_p in sorted(folder.glob(pat), key=lambda p: p.stat().st_mtime, reverse=True):
+                    if _is_candidate_binary(bin_p):
+                        _add(bin_p)
+            except OSError:
+                pass
 
         try:
             for sub in sorted(folder.glob("BeamNG.Earth*")):
                 if sub.is_dir():
                     _add(sub)
-                    for exe in sorted(sub.glob("BeamNG.Earth*.exe"), key=lambda p: p.stat().st_mtime, reverse=True):
-                        if exe.is_file() and not _is_ignored_exe_name(exe.name):
-                            _add(exe)
+                    for pat in ("BeamNG.Earth*.exe", "BeamNG.Earth*.AppImage"):
+                        for bin_p in sorted(sub.glob(pat), key=lambda p: p.stat().st_mtime, reverse=True):
+                            if _is_candidate_binary(bin_p):
+                                _add(bin_p)
         except OSError:
             pass
 
@@ -306,8 +398,16 @@ def _parse_ini_userfolder(ini_path):
     return None
 
 
-def discover_beamng_user_dirs(local_appdata=None):
-    """Return existing BeamNG.drive user folders in exact upstream priority order."""
+def discover_beamng_user_dirs(local_appdata=None, *, linux_home=None, xdg_data_home=None, xdg_cache_home=None):
+    """Return existing native BeamNG.drive user folders in exact upstream priority order."""
+    if local_appdata is None and (linux_home is not None or sys.platform.startswith("linux")):
+        return patch_server.discover_user_dirs(
+            include_system=True,
+            linux_home=linux_home,
+            xdg_data_home=xdg_data_home,
+            xdg_cache_home=xdg_cache_home,
+        )
+
     base = Path(local_appdata or os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
     raw_candidates = []
 
@@ -366,15 +466,18 @@ def _extract_mod_files_from_target(target):
                 extracted[short_rel] = p.read_bytes()
         return extracted
 
-    if target.is_file() and target.suffix.lower() == ".exe":
-        data = target.read_bytes()
-        start, _toff, _cookie, _py, _lib, entries = patch_server.archive_entries(data)
-        emap = {e[7].replace("\\", "/"): e for e in entries}
-        for short_rel, full_rel in MOD_REL_FILES:
-            e = emap.get(full_rel)
-            if e is not None:
-                blob = data[start + e[1]:start + e[1] + e[2]]
-                extracted[short_rel] = zlib.decompress(blob) if e[4] else blob
+    if target.is_file():
+        try:
+            data = target.read_bytes()
+            start, _toff, _cookie, _py, _lib, entries = patch_server.archive_entries(data)
+            emap = {e[7].replace("\\", "/"): e for e in entries}
+            for short_rel, full_rel in MOD_REL_FILES:
+                e = emap.get(full_rel)
+                if e is not None:
+                    blob = data[start + e[1]:start + e[1] + e[2]]
+                    extracted[short_rel] = zlib.decompress(blob) if e[4] else blob
+        except Exception:
+            pass
     return extracted
 
 
@@ -386,6 +489,11 @@ def _target_supports_reporter(target):
         return False
     if mode == "source":
         return all((resolved / rel).is_file() for rel in patch_server.REPORTER_SHARED_MOD_FILES)
+    if mode in ("host_dir", "host_zip"):
+        return False
+    if mode == "appimage":
+        info = patch_server.inspect_target(resolved)
+        return bool(info.get("compatible") and info.get("pythonMatches"))
     try:
         data = resolved.read_bytes()
         start, _toff, _cpos, py, _lib, entries = patch_server.archive_entries(data)
@@ -393,7 +501,7 @@ def _target_supports_reporter(target):
         if py != cur_py:
             return False
         emap = {e[7]: e for e in entries}
-        if not all(patch_server._win_rel(rel) in emap for rel in patch_server.REPORTER_SHARED_MOD_FILES):
+        if not all(patch_server._carchive_key(emap, rel) in emap for rel in patch_server.REPORTER_SHARED_MOD_FILES):
             return False
         pyz_cands = [e for e in entries if e[5] == b"z"]
         if len(pyz_cands) != 1:
@@ -596,9 +704,29 @@ def restore_unpacked_mods_on_uninstall(restored_target, receipt, discovered_user
 
 
 def stop_processes(pids, timeout_s=10.0):
-    """Close running BeamNG.Earth PIDs cleanly, escalating to /F only if still open."""
-    if os.name != "nt" or not pids:
+    """Close running BeamNG.Earth PIDs cleanly, escalating only if still open."""
+    if not pids:
         return
+    if os.name != "nt":
+        import signal
+        for pid in pids:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except OSError:
+                pass
+        deadline = time.monotonic() + min(3.0, timeout_s * 0.4)
+        while time.monotonic() < deadline:
+            alive = [pid for pid, _p in find_running_beamng_earth_processes() if pid in pids]
+            if not alive:
+                return
+            time.sleep(0.2)
+        for pid in pids:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+        return
+
     kw = {"capture_output": True, "timeout": 5}
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
         kw["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -632,52 +760,98 @@ def stop_processes(pids, timeout_s=10.0):
 
 def relaunch_beamng_earth(target):
     target = Path(target).resolve()
-    if os.name != "nt":
+    if os.name == "nt":
+        flags = 0x00000200 | 0x00000008
+        if target.is_file() and target.suffix.lower() == ".exe":
+            subprocess.Popen(
+                [str(target)],
+                cwd=str(target.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+            return True
+        launcher_py = target / "launcher.py"
+        if target.is_dir() and launcher_py.is_file():
+            subprocess.Popen(
+                [sys.executable, str(launcher_py)],
+                cwd=str(target),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+            return True
         return False
-    flags = 0x00000200 | 0x00000008
-    if target.is_file() and target.suffix.lower() == ".exe":
+
+    env = patch_server._clean_posix_env()
+    if target.is_file() and os.access(target, os.X_OK):
         subprocess.Popen(
             [str(target)],
             cwd=str(target.parent),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=flags,
+            start_new_session=True,
         )
         return True
     launcher_py = target / "launcher.py"
     if target.is_dir() and launcher_py.is_file():
+        py_bin = sys.executable if not getattr(sys, "frozen", False) else (shutil.which("python3") or "python3")
         subprocess.Popen(
-            [sys.executable, str(launcher_py)],
+            [py_bin, str(launcher_py)],
             cwd=str(target),
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=flags,
+            start_new_session=True,
         )
         return True
     return False
 
 
 def _start_deferred_swap(status_path, helper_ps1):
-    command = "& '{}' -Receipt '{}'".format(
-        str(helper_ps1).replace("'", "''"),
-        str(status_path).replace("'", "''"),
-    )
-    encoded = __import__("base64").b64encode(command.encode("utf-16le")).decode("ascii")
+    if os.name == "nt":
+        command = "& '{}' -Receipt '{}'".format(
+            str(helper_ps1).replace("'", "''"),
+            str(status_path).replace("'", "''"),
+        )
+        encoded = __import__("base64").b64encode(command.encode("utf-16le")).decode("ascii")
+        subprocess.Popen(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ],
+            creationflags=0x08000000 | 0x00000200,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+
+    posix_helper = Path(helper_ps1).parent / "deferred_posix.py"
+    env = patch_server._clean_posix_env()
+    if not getattr(sys, "frozen", False) and sys.executable and Path(sys.executable).is_file():
+        py_cmd = [sys.executable, "-B"]
+    else:
+        py_bin = shutil.which("python3.12", path=env.get("PATH")) or shutil.which("python3", path=env.get("PATH")) or shutil.which("python", path=env.get("PATH"))
+        if not py_bin:
+            raise patch_server.PatchError("Python 3 is required on Linux to finalize the background swap.")
+        py_cmd = [py_bin, "-B"]
     subprocess.Popen(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            encoded,
-        ],
-        creationflags=0x08000000 | 0x00000200,
+        [*py_cmd, str(posix_helper), "--receipt", str(status_path)],
+        env=env,
+        start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -694,7 +868,7 @@ def _cleanup_after_restore(target, mode, state_root):
     except Exception:
         pass
 
-    if mode == "exe":
+    if mode in ("exe", "appimage", "host_zip"):
         backup = target.with_name(f"{target.name}.{patch_server.TAG}.original")
         sidecar = target.with_name(f"{target.name}.{patch_server.TAG}.json")
         for f in (backup, sidecar):
@@ -705,7 +879,7 @@ def _cleanup_after_restore(target, mode, state_root):
                 pend.unlink()
             except OSError:
                 pass
-    elif mode == "source":
+    elif mode in ("source", "host_dir"):
         tag_dir = target / f".{patch_server.TAG}"
         if tag_dir.is_dir():
             shutil.rmtree(tag_dir, ignore_errors=True)
@@ -717,9 +891,13 @@ def _cleanup_after_restore(target, mode, state_root):
                 p.unlink()
             except OSError:
                 pass
-    mod_backups = state_root / "mod_backups"
-    if mod_backups.is_dir():
-        shutil.rmtree(mod_backups, ignore_errors=True)
+    for sub_name in ("mod_backups", "zip_mod_backups"):
+        sub_dir = state_root / sub_name
+        if sub_dir.is_dir():
+            shutil.rmtree(sub_dir, ignore_errors=True)
+    for appdir_cand in state_root.glob("patched_appdir_*"):
+        if appdir_cand.is_dir():
+            shutil.rmtree(appdir_cand, ignore_errors=True)
     try:
         if state_root.is_dir() and not any(state_root.iterdir()):
             state_root.rmdir()
@@ -740,10 +918,10 @@ def perform_install(
     relaunch_after=False,
     notify_on_defer=False,
 ):
-    """Install Traffic and AutoDrive fixes onto target (.exe or source dir) and sync unpacked BeamNG.drive mod."""
+    """Install Traffic and AutoDrive fixes onto target and sync BeamNG.drive mod folders."""
     target = normalize_candidate_target(target)
     if target is None:
-        raise patch_server.PatchError("Could not find a valid BeamNG.Earth.exe or source directory at that path.")
+        raise patch_server.PatchError("Could not find a valid BeamNG.Earth installation at that path.")
 
     state_root = Path(state_root) if state_root else default_state_dir(local_appdata=local_appdata)
     state_root.mkdir(parents=True, exist_ok=True)
@@ -780,6 +958,15 @@ def perform_install(
         discovered_udirs,
         payload_dir,
         state_root,
+        apply_fixes=apply_fixes,
+        enable_reporter=eff_reporter,
+        patch_tier=record.get("patchTier", patch_server.TIER_FULL_SOLVER),
+    )
+    patch_server.sync_discovered_user_mods(
+        payload_dir,
+        state_root,
+        user_dirs=discovered_udirs,
+        operation="install",
         apply_fixes=apply_fixes,
         enable_reporter=eff_reporter,
         patch_tier=record.get("patchTier", patch_server.TIER_FULL_SOLVER),
@@ -837,7 +1024,7 @@ def perform_install(
                 time.sleep(0.5)
         if last_err is not None:
             raise patch_server.PatchError(
-                "Windows still has BeamNG.Earth.exe open. Close BeamNG.Earth completely and run 1_Click_Install.bat again."
+                "BeamNG.Earth is still open. Close BeamNG.Earth completely and run setup again."
             ) from last_err
 
     receipt_data = {
@@ -911,6 +1098,12 @@ def perform_uninstall(
     if record["state"] == "pending":
         if self_exe:
             cleaned_mods = restore_unpacked_mods_on_uninstall(None, receipt, discovered_udirs)
+            patch_server.sync_discovered_user_mods(
+                payload_dir,
+                state_root,
+                user_dirs=discovered_udirs,
+                operation="restore",
+            )
             record.update(
                 standalone=True,
                 companionPid=os.getpid(),
@@ -938,16 +1131,22 @@ def perform_uninstall(
                 time.sleep(0.5)
         if last_err is not None:
             raise patch_server.PatchError(
-                "Windows still has BeamNG.Earth.exe open. Close BeamNG.Earth completely and run 1_Click_Uninstall.bat again."
+                "BeamNG.Earth is still open. Close BeamNG.Earth completely and run uninstall again."
             ) from last_err
 
     mode = record.get("mode", "exe" if target.is_file() else "source")
-    if mode == "exe" and record.get("originalSha"):
+    if mode in ("exe", "appimage", "host_zip") and record.get("originalSha"):
         actual_sha = patch_server.sha256_file(target)
         if actual_sha != record["originalSha"]:
-            raise patch_server.PatchError("Restored executable checksum mismatch; backup kept for safety.")
+            raise patch_server.PatchError("Restored target checksum mismatch; backup kept for safety.")
 
     cleaned_mods = restore_unpacked_mods_on_uninstall(target, receipt, discovered_udirs)
+    patch_server.sync_discovered_user_mods(
+        payload_dir,
+        state_root,
+        user_dirs=discovered_udirs,
+        operation="restore",
+    )
     _cleanup_after_restore(target, mode, state_root)
 
     if relaunch_after:
@@ -1184,10 +1383,17 @@ class SetupUI:
         return targets[0]
 
 
-def _matching_running_pids(target):
+def _matching_running_pids(target, self_exe=False):
     target_norm = _norm_key(target)
+    excluded = _self_exe_excluded_pids(self_exe=self_exe)
+    try:
+        running = find_running_beamng_earth_processes(self_exe=self_exe, exclude_pids=excluded)
+    except TypeError:
+        running = find_running_beamng_earth_processes()
     pids = []
-    for pid, exe_path in find_running_beamng_earth_processes():
+    for pid, exe_path in running:
+        if pid in excluded:
+            continue
         if not exe_path:
             if Path(target).is_file():
                 pids.append(pid)
@@ -1206,7 +1412,7 @@ def run_interactive(action, args, ui=None):
     self_exe = False
     if args.self_exe:
         target = normalize_candidate_target(args.self_exe)
-        self_exe = target is not None and _norm_key(sys.executable) == _norm_key(target)
+        self_exe = target is not None
     elif args.target:
         target = normalize_candidate_target(args.target)
     else:
@@ -1231,8 +1437,8 @@ def run_interactive(action, args, ui=None):
 
     if target is None:
         raise patch_server.PatchError(
-            "Could not find BeamNG.Earth.exe.\n\n"
-            f"Make sure BeamNG.Earth ({patch_server.MIN_SUPPORTED_EARTH_VERSION} or newer) is downloaded on this PC, then try again."
+            "Could not find BeamNG.Earth.\n\n"
+            f"Make sure BeamNG.Earth ({patch_server.MIN_SUPPORTED_EARTH_VERSION} or newer) is downloaded on this machine, then try again."
         )
 
     ui.say(f"Target BeamNG.Earth : {target}")
@@ -1240,7 +1446,7 @@ def run_interactive(action, args, ui=None):
     if action == "install":
         verify_target_compatibility(target, payload_dir=PAYLOAD_DIR)
 
-    running_pids = _matching_running_pids(target)
+    running_pids = _matching_running_pids(target, self_exe=self_exe)
     relaunch_after = bool(args.relaunch)
 
     if running_pids:
@@ -1329,8 +1535,8 @@ def build_arg_parser():
 
 
 def main(argv=None):
-    if os.name != "nt" and os.environ.get("BNE_ADF_ALLOW_NON_WINDOWS_TEST") != "1":
-        print("This installer is for Windows (BeamNG.Earth on Windows 10/11).", file=sys.stderr)
+    if not _is_supported_platform():
+        print("This installer supports Windows 10/11 and Linux x86_64.", file=sys.stderr)
         return 1
 
     parser = build_arg_parser()

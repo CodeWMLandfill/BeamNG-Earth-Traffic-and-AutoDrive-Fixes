@@ -23,9 +23,10 @@ You can use **Traffic and AutoDrive fixes** on its own or together with [BeamNG.
 ## Install - Option 1 (1-Click ZIP)
 
 1. Click the green **Code** button above -> **Download ZIP** (or [download the ZIP directly](https://github.com/CodeWMLandfill/BeamNG-Earth-Traffic-and-AutoDrive-Fixes/archive/refs/heads/main.zip)).
-2. Right-click the `.zip` file, click **Extract All...**, and open the extracted folder.
-3. Double-click **`1_Click_Install.bat`**.
-   - It automatically finds **BeamNG.Earth** on your PC and offers to close and restart it for you if it is running.
+2. Extract the `.zip` archive and open the extracted folder.
+3. **Windows:** Double-click **`1_Click_Install.bat`**.
+   **Linux:** Run `./1_Click_Install.sh` (or `python3 tools/easy_setup.py install`).
+   - It automatically finds **BeamNG.Earth** (`BeamNG.Earth*.exe`, `BeamNG.Earth*.AppImage`, or source checkout) and offers to close and restart it for you if it is running.
 
 ## Install - Option 2 (Inside BeamNG.Earth)
 
@@ -33,11 +34,11 @@ You can use **Traffic and AutoDrive fixes** on its own or together with [BeamNG.
 2. Enter `CodeWMLandfill/BeamNG-Earth-Traffic-and-AutoDrive-Fixes` and click **Install**.
 3. Click **Start** on the add-on card, then close and restart **BeamNG.Earth**.
 
-*(Tip: You can also download `beamng_earth_autodrive_fixes.py` from the [Releases](https://github.com/CodeWMLandfill/BeamNG-Earth-Traffic-and-AutoDrive-Fixes/releases) tab and double-click it in File Explorer to launch the 1-click setup.)*
+*(Tip: You can also download `beamng_earth_autodrive_fixes.py` from the [Releases](https://github.com/CodeWMLandfill/BeamNG-Earth-Traffic-and-AutoDrive-Fixes/releases) tab and double-click it on Windows or run `python3 beamng_earth_autodrive_fixes.py` on Linux to launch the 1-click setup.)*
 
 ## Uninstall
 
-- **From the ZIP folder:** Double-click **`1_Click_Uninstall.bat`** to restore the original **BeamNG.Earth** in one click.
+- **From the ZIP folder:** Double-click **`1_Click_Uninstall.bat`** (Windows) or run **`./1_Click_Uninstall.sh`** (Linux) to restore the original **BeamNG.Earth** byte-for-byte in one click.
 - **Inside BeamNG.Earth:** Open **Add-ons** -> **Options**, choose **`Restore original app`**, click **Save**, click **Start**, and restart **BeamNG.Earth**.
 
 ## Report a Traffic or AutoDrive Issue (`Ctrl+Shift+T`)
@@ -52,5 +53,5 @@ Press **`Ctrl+Shift+T`** anytime while driving to silently send a quick screensh
 
 ## Requirements
 
-- **Windows 10 or 11** (64-bit).
-- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** and **v1.10.1-beta.dev.574** (older versions are skipped safely with a clear notice).
+- **Windows 10 or 11** (64-bit) or **Linux** (`x86_64` AppImage, standalone binary, Host server, or source checkout).
+- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** and **v1.10.1-beta.dev.591** (older versions are skipped safely with a clear notice).

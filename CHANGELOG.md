@@ -2,6 +2,15 @@
 
 All notable changes to **BeamNG.Earth - Traffic and AutoDrive fixes** are documented in this file.
 
+## [0.1.1] - 2026-11-25
+
+### Added
+- **Full Native Linux Support (`x86_64`):** Supports **BeamNG.Earth** Linux Type 2 `.AppImage` builds (both repacked via `mksquashfs` and zero-dependency extracted AppDir + POSIX launcher fallback), standalone PyInstaller ELF64 installations, `BeamNG.Earth-Host` server client-mod archives, and source checkouts, with detached pure-Python POSIX background swap and automatic native Linux **BeamNG.drive** user-folder discovery.
+- **Cache-Key Isolation & `dev.591` Compatibility:** Deterministically salts bundled `CODE_ID` and `REVISIT_ID` digests during binary/AppImage patching (restoring exact SHA-256 bytes on uninstall) and adds full compatibility through **BeamNG.Earth v1.10.1-beta.dev.591**.
+
+### Fixed
+- **1-Click Installer Self-Exe Guard:** Prevents `--self-exe` fallback mode (when system Python is absent) from terminating its own PyInstaller bootloader parent process during setup.
+
 ## [0.1.0] - 2026-11-24
 
 ### Added

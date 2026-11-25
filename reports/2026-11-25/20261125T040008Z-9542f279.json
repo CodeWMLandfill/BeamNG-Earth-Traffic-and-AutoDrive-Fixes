@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "20261125T040008Z-9542f279",
+  "createdAt": "2026-11-25T04:00:08.611Z",
+  "lat": 0,
+  "lon": 0,
+  "kind": "autodrive",
+  "addonId": "beamng-earth-autodrive-fixes",
+  "summary": "Automated Ctrl+Shift+T E2E smoke check @ 0.00000, 0.00000",
+  "note": "[Automated E2E Smoke Test - Safe to Close]",
+  "earthVersion": "1.10.1-beta.dev.574",
+  "addonVersion": "0.1.0",
+  "headingDeg": 90,
+  "altM": 12.5,
+  "speedMs": 14.2,
+  "nearest": {
+    "drivingTelemetry": {
+      "autodriveActive": true,
+      "aiMode": "manual",
+      "targetSpeedKmh": 60,
+      "overtakeState": "cruising",
+      "trafficVehicleCount": 4
+    },
+    "addonId": "beamng-earth-autodrive-fixes"
+  },
+  "drivingTelemetry": {
+    "autodriveActive": true,
+    "aiMode": "manual",
+    "targetSpeedKmh": 60,
+    "overtakeState": "cruising",
+    "trafficVehicleCount": 4
+  },
+  "screenshotPath": "screenshots/2026-11-25/20261125T040008Z-9542f279.jpg"
+}

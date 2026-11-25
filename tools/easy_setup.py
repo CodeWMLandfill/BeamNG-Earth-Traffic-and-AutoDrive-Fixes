@@ -760,12 +760,14 @@ def stop_processes(pids, timeout_s=10.0):
 
 def relaunch_beamng_earth(target):
     target = Path(target).resolve()
+    env = patch_server._clean_posix_env()
     if os.name == "nt":
         flags = 0x00000200 | 0x00000008
         if target.is_file() and target.suffix.lower() == ".exe":
             subprocess.Popen(
                 [str(target)],
                 cwd=str(target.parent),
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -777,6 +779,7 @@ def relaunch_beamng_earth(target):
             subprocess.Popen(
                 [sys.executable, str(launcher_py)],
                 cwd=str(target),
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -785,7 +788,6 @@ def relaunch_beamng_earth(target):
             return True
         return False
 
-    env = patch_server._clean_posix_env()
     if target.is_file() and os.access(target, os.X_OK):
         subprocess.Popen(
             [str(target)],
@@ -814,14 +816,22 @@ def relaunch_beamng_earth(target):
 
 
 def _start_deferred_swap(status_path, helper_ps1):
+    env = patch_server._clean_posix_env()
+    env.pop("BNGEARTH_PARENT", None)
     if os.name == "nt":
         command = "& '{}' -Receipt '{}'".format(
             str(helper_ps1).replace("'", "''"),
             str(status_path).replace("'", "''"),
         )
         encoded = __import__("base64").b64encode(command.encode("utf-16le")).decode("ascii")
-        subprocess.Popen(
+        tramp = subprocess.Popen(
             [
+                os.environ.get("COMSPEC") or "cmd.exe",
+                "/d",
+                "/c",
+                "start",
+                "",
+                "/b",
                 "powershell.exe",
                 "-NoProfile",
                 "-NonInteractive",
@@ -832,15 +842,17 @@ def _start_deferred_swap(status_path, helper_ps1):
                 "-EncodedCommand",
                 encoded,
             ],
+            cwd=tempfile.gettempdir(),
+            env=env,
             creationflags=0x08000000 | 0x00000200,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        tramp.wait(timeout=5)
         return
 
     posix_helper = Path(helper_ps1).parent / "deferred_posix.py"
-    env = patch_server._clean_posix_env()
     if not getattr(sys, "frozen", False) and sys.executable and Path(sys.executable).is_file():
         py_cmd = [sys.executable, "-B"]
     else:
@@ -850,6 +862,7 @@ def _start_deferred_swap(status_path, helper_ps1):
         py_cmd = [py_bin, "-B"]
     subprocess.Popen(
         [*py_cmd, str(posix_helper), "--receipt", str(status_path)],
+        cwd=tempfile.gettempdir(),
         env=env,
         start_new_session=True,
         stdin=subprocess.DEVNULL,
@@ -891,7 +904,7 @@ def _cleanup_after_restore(target, mode, state_root):
                 p.unlink()
             except OSError:
                 pass
-    for sub_name in ("mod_backups", "zip_mod_backups"):
+    for sub_name in ("mod_backups", "zip_mod_backups", "unpacked_mod_backups"):
         sub_dir = state_root / sub_name
         if sub_dir.is_dir():
             shutil.rmtree(sub_dir, ignore_errors=True)
@@ -1137,7 +1150,7 @@ def perform_uninstall(
     mode = record.get("mode", "exe" if target.is_file() else "source")
     if mode in ("exe", "appimage", "host_zip") and record.get("originalSha"):
         actual_sha = patch_server.sha256_file(target)
-        if actual_sha != record["originalSha"]:
+        if actual_sha != record["originalSha"] and actual_sha != record.get("replacementSha"):
             raise patch_server.PatchError("Restored target checksum mismatch; backup kept for safety.")
 
     cleaned_mods = restore_unpacked_mods_on_uninstall(target, receipt, discovered_udirs)

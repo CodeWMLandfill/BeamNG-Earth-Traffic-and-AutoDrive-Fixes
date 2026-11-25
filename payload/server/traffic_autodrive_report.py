@@ -38,7 +38,7 @@ ADDON_OPTION_IDS = (
     "beamng-earth-traffic-and-autod",
     "beamng-earth-traffic-and-autodrive-fixes",
 )
-ADDON_VERSION = "0.1.1"
+ADDON_VERSION = "0.1.2"
 REPORTS_SUBDIR = "traffic_autodrive_reports"
 MAX_SHOT_BYTES = int(1.45 * 1024 * 1024)
 ALLOWED_KINDS = ("autodrive", "traffic", "overtake", "routing", "road", "other")

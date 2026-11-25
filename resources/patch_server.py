@@ -8,6 +8,8 @@ add-ons (such as Bridge, Rail & Tunnel Fixes on Ctrl+Shift+B).
 """
 import argparse
 import ast
+import base64
+import contextlib
 import ctypes
 import dis
 import glob
@@ -25,20 +27,21 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zipfile
 import zlib
 
 TAG = "earthAutodriveFixes"
-MARKER = "EARTH_AUTODRIVE_FIXES_0_1_1"
+MARKER = "EARTH_AUTODRIVE_FIXES_0_1_2"
 MARKER_PREFIX = b"EARTH_AUTODRIVE_FIXES_"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 MIN_SUPPORTED_EARTH_VERSION = "v1.9.1-beta.dev.424"
-MAX_SOLVER_FAST_VERSION = 625
 TIER_FULL_SOLVER = "full_solver"
 TIER_CLIENT_AND_REPORTER = "client_and_reporter"
 STATE_FOLDER_NAME = "BeamNG-Earth-Autodrive-Fixes"
 CARCHIVE_CACHE_ID_KEYS = ("CODE_ID", "REVISIT_ID")
+TAF_CARCHIVE_BACKUP_KEY = "_taf_orig_mods.zlib"
 APPIMAGE_WRAPPER_MAGIC = b"# EARTH_AUTODRIVE_FIXES_APPIMAGE_WRAPPER\n"
 
 MAGIC = b"MEI\x0c\x0b\x0a\x0b\x0e"
@@ -398,15 +401,31 @@ def read_experimental_flags(user_dir=None):
     return out
 
 
+def unpatch_settings_lua_bytes(raw_bytes):
+    if not raw_bytes or b"function M.autodriveTune" not in raw_bytes:
+        return raw_bytes
+    text = raw_bytes.decode("utf-8-sig")
+    crlf = "\r\n" in text
+    norm = text.replace("\r\n", "\n")
+    ext_block = "\n" + _SETTINGS_AUTODRIVE_EXT_LUA.strip("\n")
+    if ext_block in norm:
+        cleaned = norm.replace(ext_block, "", 1)
+        if crlf:
+            cleaned = cleaned.replace("\n", "\r\n")
+        return cleaned.encode("utf-8")
+    return raw_bytes
+
+
 def patch_settings_lua_bytes(upstream_bytes, payload_bytes):
     """Preserve upstream Experimental switches on dev.456+ while injecting Autodrive Tune."""
     if not upstream_bytes or b"M.SCHEMA" not in upstream_bytes:
         return payload_bytes
     if b"EXPERIMENTAL_ORDER" not in upstream_bytes and b"M.ORDER" not in upstream_bytes:
         return payload_bytes
-    if b"function M.autodriveTune" in upstream_bytes:
-        return upstream_bytes
-    text = upstream_bytes.decode("utf-8-sig")
+    base_bytes = unpatch_settings_lua_bytes(upstream_bytes)
+    if b"function M.autodriveTune" in base_bytes:
+        return base_bytes
+    text = base_bytes.decode("utf-8-sig")
     crlf = "\r\n" in text
     norm = text.replace("\r\n", "\n")
     idx = norm.rfind("\nreturn M")
@@ -711,21 +730,12 @@ def _read_entry_bytes(data, start, entry):
 
 
 def _detect_exe_patch_tier(data, start, entry_map, pz, offset, toc):
+    del pz, offset, toc
     gps_body = _read_entry_bytes(data, start, entry_map.get(_carchive_key(entry_map, MOD_GPS_LUA)))
     if f"tier={TIER_CLIENT_AND_REPORTER}".encode("ascii") in gps_body:
         return TIER_CLIENT_AND_REPORTER
     if _has_taf_marker(gps_body):
         return TIER_FULL_SOLVER
-    if len(pz) >= 8 and pz[4:8] == importlib.util.MAGIC_NUMBER and "fast" in toc:
-        try:
-            k, p_off, p_len = toc["fast"]
-            if k == 0 and 12 <= p_off and p_off + p_len <= offset:
-                fast_co = marshal.loads(zlib.decompress(pz[p_off:p_off + p_len]))
-                fast_min = _extract_fast_min_version_from_code(fast_co)
-                if fast_min is not None and fast_min > MAX_SOLVER_FAST_VERSION:
-                    return TIER_CLIENT_AND_REPORTER
-        except Exception:
-            pass
     ad_body = _read_entry_bytes(data, start, entry_map.get(_carchive_key(entry_map, MOD_AUTODRIVE_LUA)))
     nav_body = _read_entry_bytes(data, start, entry_map.get(_carchive_key(entry_map, MOD_NAVGRAPH_LUA)))
     if _mod_files_drifted(gps_body, ad_body, nav_body):
@@ -741,13 +751,8 @@ def _detect_source_patch_tier(root, sidecar=None):
     gps_body = gps_file.read_bytes() if gps_file.is_file() else b""
     if f"tier={TIER_CLIENT_AND_REPORTER}".encode("ascii") in gps_body:
         return TIER_CLIENT_AND_REPORTER
-    if MARKER.encode("ascii") in gps_body:
+    if _has_taf_marker(gps_body):
         return TIER_FULL_SOLVER
-    fast_file = root / "server" / "fast.py"
-    if fast_file.is_file():
-        fast_min = _extract_fast_min_version_from_source(fast_file.read_text(encoding="utf-8", errors="replace"))
-        if fast_min is not None and fast_min > MAX_SOLVER_FAST_VERSION:
-            return TIER_CLIENT_AND_REPORTER
     ad_file = root / MOD_AUTODRIVE_LUA
     ad_body = ad_file.read_bytes() if ad_file.is_file() else b""
     nav_file = root / MOD_NAVGRAPH_LUA
@@ -843,10 +848,13 @@ def patch_pyz_for_reporter(pz_data, payload_dir, patch_tier=TIER_FULL_SOLVER):
         raise PatchError("Corrupt embedded Python archive table of contents")
     raw_toc = marshal.loads(pz_data[offset:])
     toc = dict(raw_toc)
+    if ORIG_EARTHD_MODULE in toc or SERVER_REPORTER_MODULE in toc:
+        pz_data = unpatch_pyz_for_reporter(pz_data)
+        offset = struct.unpack_from("!i", pz_data, 8)[0]
+        raw_toc = marshal.loads(pz_data[offset:])
+        toc = dict(raw_toc)
     if "earthd" not in toc:
         raise PatchError("Executable does not contain expected server module 'earthd'")
-    if ORIG_EARTHD_MODULE in toc or SERVER_REPORTER_MODULE in toc:
-        raise PatchError("A Traffic and AutoDrive fixes PYZ patch is already present without a matching receipt")
     e_kind, e_pos, e_len = toc["earthd"]
     if e_kind != 0 or e_pos < 12 or e_pos + e_len > offset:
         raise PatchError("Unsupported PYZ entry layout for 'earthd'")
@@ -896,7 +904,7 @@ def unpatch_pyz_for_reporter(pz_data):
                 ek, ep, el = toc["earthd"]
                 if ek == 0 and 12 <= ep and ep + el <= offset:
                     ec = marshal.loads(zlib.decompress(pz_data[ep:ep + el]))
-                    earthd_is_taf = MARKER in repr(ec.co_consts)
+                    earthd_is_taf = "EARTH_AUTODRIVE_FIXES_" in repr(ec.co_consts)
             except Exception:
                 earthd_is_taf = False
         if earthd_is_taf or "_brf_orig_earthd" not in toc:
@@ -965,6 +973,257 @@ def unpatch_source_earthd_bytes(raw_bytes):
     return norm.encode("utf-8")
 
 
+def _encode_embedded_taf_backup(mod_backups, cache_id_backups):
+    doc = {
+        "mods": {k: base64.b64encode(v).decode("ascii") for k, v in mod_backups.items()},
+        "cacheIds": {k: base64.b64encode(v).decode("ascii") for k, v in cache_id_backups.items()},
+    }
+    return zlib.compress(json.dumps(doc, separators=(",", ":")).encode("utf-8"), 6)
+
+
+def _decode_embedded_taf_backup(raw_blob):
+    if not raw_blob:
+        return {}, {}
+    try:
+        raw_json = zlib.decompress(raw_blob)
+    except zlib.error:
+        raw_json = raw_blob
+    try:
+        doc = json.loads(raw_json.decode("utf-8"))
+        mods = {k: base64.b64decode(v) for k, v in (doc.get("mods") or {}).items()}
+        cids = {k: base64.b64decode(v) for k, v in (doc.get("cacheIds") or {}).items()}
+        return mods, cids
+    except Exception:
+        return {}, {}
+
+
+def _has_brf_footprint_in_exe(exe_bytes):
+    if b"EARTH_BRIDGE_RAIL_FIXES_" in exe_bytes:
+        return True
+    try:
+        c_start, _toff, _cpos, _py, _lib, c_entries = archive_entries(exe_bytes)
+        c_map = {e[7]: e for e in c_entries}
+        if _carchive_key(c_map, "mod/beamng_earth/lua/ge/extensions/beamngEarth/bugreport.lua") in c_map:
+            return True
+        c_pyz = [e for e in c_entries if e[5] == b"z"]
+        if len(c_pyz) == 1:
+            pz_chk = _read_entry_bytes(exe_bytes, c_start, c_pyz[0])
+            _, _, toc_chk = _read_pyz_toc(pz_chk)
+            return any(k == "bridge_rail_report" or k.startswith("_brf_orig_") for k in toc_chk)
+    except Exception:
+        pass
+    return False
+
+
+def _has_taf_footprint_in_exe(exe_bytes):
+    try:
+        c_start, _toff, _cpos, _py, _lib, c_entries = archive_entries(exe_bytes)
+        c_map = {e[7]: e for e in c_entries}
+        if TAF_CARCHIVE_BACKUP_KEY in c_map or _carchive_key(c_map, MOD_TRAFFICREPORT_LUA) in c_map:
+            return True
+        m_ent = c_map.get(_carchive_key(c_map, MOD_MARKER_FILE))
+        if m_ent is not None and _has_taf_marker(_read_entry_bytes(exe_bytes, c_start, m_ent)):
+            return True
+        c_pyz = [e for e in c_entries if e[5] == b"z"]
+        if len(c_pyz) == 1:
+            pz_chk = _read_entry_bytes(exe_bytes, c_start, c_pyz[0])
+            _, _, toc_chk = _read_pyz_toc(pz_chk)
+            if ORIG_EARTHD_MODULE in toc_chk or SERVER_REPORTER_MODULE in toc_chk:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _strip_taf_from_carchive_bytes(current_exe_bytes, backup_exe_bytes=None):
+    """Surgically remove ONLY Traffic and AutoDrive fixes entries from current_exe_bytes in memory."""
+    c_start, _c_toff, c_cookie_pos, c_py, c_lib, c_entries = archive_entries(current_exe_bytes)
+    c_map = {e[7]: e for e in c_entries}
+    cur_ver = _read_carchive_version(current_exe_bytes, c_start, c_map)
+
+    emb_mods, emb_cids = {}, {}
+    if TAF_CARCHIVE_BACKUP_KEY in c_map:
+        emb_raw = _read_entry_bytes(current_exe_bytes, c_start, c_map[TAF_CARCHIVE_BACKUP_KEY])
+        emb_mods, emb_cids = _decode_embedded_taf_backup(emb_raw)
+
+    b_start, b_map = 0, {}
+    if backup_exe_bytes:
+        try:
+            b_start, _bt, _bc, _bpy, _blib, b_entries = archive_entries(backup_exe_bytes)
+            cand_bmap = {e[7]: e for e in b_entries}
+            b_ver = _read_carchive_version(backup_exe_bytes, b_start, cand_bmap)
+            if not cur_ver or not b_ver or cur_ver == b_ver:
+                b_map = cand_bmap
+        except Exception:
+            b_map = {}
+
+    has_brf = _has_brf_footprint_in_exe(current_exe_bytes)
+    mod_key_to_rel = {_carchive_key(c_map, rel): rel for rel in MOD_FILES}
+    tr_arc_key = _carchive_key(c_map, MOD_TRAFFICREPORT_LUA)
+    act_arc_key = _carchive_key(c_map, MOD_ACTIONS_JSON)
+    key_arc_key = _carchive_key(c_map, MOD_KEYMAP_JSON)
+    ms_arc_key = _carchive_key(c_map, MOD_SCRIPT_LUA)
+
+    c_cookie_end = c_cookie_pos + COOKIE.size
+    header, _signed, checksum_at = strip_signature(current_exe_bytes, c_cookie_end)
+    new_body = bytearray()
+    new_toc = bytearray()
+
+    for n, pos, length, raw, comp, kind, namebytes, name in c_entries:
+        if name == TAF_CARCHIVE_BACKUP_KEY:
+            continue
+        if name == tr_arc_key and name not in b_map:
+            continue
+        out_pos = len(new_body)
+        if name in mod_key_to_rel:
+            rel = mod_key_to_rel[name]
+            if rel in emb_mods:
+                orig_mod_raw = emb_mods[rel]
+                chunk = zlib.compress(orig_mod_raw, 6) if comp else orig_mod_raw
+                new_body.extend(chunk)
+                new_toc.extend(ENTRY.pack(n, out_pos, len(chunk), len(orig_mod_raw), comp, kind) + namebytes)
+            elif name in b_map:
+                be = b_map[name]
+                chunk = backup_exe_bytes[b_start + be[1]:b_start + be[1] + be[2]]
+                new_body.extend(chunk)
+                new_toc.extend(ENTRY.pack(n, out_pos, be[2], be[3], be[4], be[5]) + namebytes)
+            else:
+                cur_mod = _read_entry_bytes(current_exe_bytes, c_start, (n, pos, length, raw, comp, kind, namebytes, name))
+                cleaned_mod = _strip_existing_taf_marker_lines(cur_mod)
+                if rel == MOD_SETTINGS_LUA:
+                    cleaned_mod = unpatch_settings_lua_bytes(cleaned_mod)
+                chunk = zlib.compress(cleaned_mod, 6) if comp else cleaned_mod
+                new_body.extend(chunk)
+                new_toc.extend(ENTRY.pack(n, out_pos, len(chunk), len(cleaned_mod), comp, kind) + namebytes)
+        elif name in CARCHIVE_CACHE_ID_KEYS and not has_brf and (name in emb_cids or name in b_map):
+            if name in emb_cids:
+                cid_raw = emb_cids[name]
+                chunk = zlib.compress(cid_raw, 6) if comp else cid_raw
+                new_body.extend(chunk)
+                new_toc.extend(ENTRY.pack(n, out_pos, len(chunk), len(cid_raw), comp, kind) + namebytes)
+            else:
+                be = b_map[name]
+                chunk = backup_exe_bytes[b_start + be[1]:b_start + be[1] + be[2]]
+                new_body.extend(chunk)
+                new_toc.extend(ENTRY.pack(n, out_pos, be[2], be[3], be[4], be[5]) + namebytes)
+        elif kind == b"z":
+            pz_cur = _read_entry_bytes(current_exe_bytes, c_start, (n, pos, length, raw, comp, kind, namebytes, name))
+            pz_un = unpatch_pyz_for_reporter(pz_cur)
+            if pz_un != pz_cur:
+                chunk = zlib.compress(pz_un, 6) if comp else pz_un
+                new_body.extend(chunk)
+                new_toc.extend(ENTRY.pack(n, out_pos, len(chunk), len(pz_un), comp, kind) + namebytes)
+            else:
+                chunk = bytes(header[c_start + pos:c_start + pos + length])
+                new_body.extend(chunk)
+                new_toc.extend(ENTRY.pack(n, out_pos, length, raw, comp, kind) + namebytes)
+        elif name in (act_arc_key, key_arc_key, ms_arc_key):
+            cur_raw = _read_entry_bytes(current_exe_bytes, c_start, (n, pos, length, raw, comp, kind, namebytes, name))
+            if name == act_arc_key:
+                un_raw = unpatch_actions_json_bytes(cur_raw)
+            elif name == key_arc_key:
+                un_raw = unpatch_keymap_json_bytes(cur_raw)
+            else:
+                un_raw = unpatch_modscript_bytes(cur_raw)
+            chunk = zlib.compress(un_raw, 6) if comp else un_raw
+            new_body.extend(chunk)
+            new_toc.extend(ENTRY.pack(n, out_pos, len(chunk), len(un_raw), comp, kind) + namebytes)
+        else:
+            chunk = bytes(header[c_start + pos:c_start + pos + length])
+            new_body.extend(chunk)
+            new_toc.extend(ENTRY.pack(n, out_pos, length, raw, comp, kind) + namebytes)
+
+    cookie = COOKIE.pack(MAGIC, len(new_body) + len(new_toc) + COOKIE.size, len(new_body), len(new_toc), c_py, c_lib)
+    new_carchive = new_body + new_toc + cookie
+    if current_exe_bytes[:4] == b"\x7fELF":
+        result_bytes = _rebuild_elf64_with_carchive(current_exe_bytes, c_start, c_cookie_end, new_carchive)
+    else:
+        result = bytearray(header[:c_start]) + new_carchive
+        if checksum_at is not None:
+            struct.pack_into("<I", result, checksum_at, pe_checksum(result, checksum_at))
+        result_bytes = bytes(result)
+    archive_entries(result_bytes)
+    return result_bytes
+
+
+def _exe_matches_desired_install(exe_bytes, payload_dir, apply_fixes, enable_reporter):
+    """Content-based check: True when exe_bytes already carries this exact version/payload/options."""
+    if payload_dir is None:
+        return False, ""
+    try:
+        start, _toff, _cpos, py, _lib, entries = archive_entries(exe_bytes)
+    except Exception:
+        return False, ""
+    entry_map = {e[7]: e for e in entries}
+    gps_entry = entry_map.get(_carchive_key(entry_map, MOD_MARKER_FILE))
+    if gps_entry is None:
+        return False, ""
+    gps_body = _read_entry_bytes(exe_bytes, start, gps_entry)
+    if MARKER.encode("ascii") not in gps_body:
+        return False, ""
+
+    is_client_tier = f"tier={TIER_CLIENT_AND_REPORTER}".encode("ascii") in gps_body
+    cur_tier = TIER_CLIENT_AND_REPORTER if is_client_tier else TIER_FULL_SOLVER
+    if not apply_fixes and cur_tier != TIER_CLIENT_AND_REPORTER:
+        return False, ""
+    if apply_fixes and cur_tier != TIER_FULL_SOLVER:
+        ad_b = _read_entry_bytes(exe_bytes, start, entry_map.get(_carchive_key(entry_map, MOD_AUTODRIVE_LUA)))
+        nav_b = _read_entry_bytes(exe_bytes, start, entry_map.get(_carchive_key(entry_map, MOD_NAVGRAPH_LUA)))
+        if not _mod_files_drifted(gps_body, ad_b, nav_b):
+            return False, ""
+
+    payload_root = Path(payload_dir)
+    if apply_fixes and cur_tier == TIER_FULL_SOLVER:
+        for rel in MOD_FILES:
+            src = payload_root / rel
+            if not src.is_file():
+                return False, ""
+            actual = _read_entry_bytes(exe_bytes, start, entry_map.get(_carchive_key(entry_map, rel)))
+            if rel == MOD_SETTINGS_LUA:
+                if b"M.SCHEMA" in actual and (b"M.ORDER" in actual or b"EXPERIMENTAL_ORDER" in actual):
+                    if b"function M.autodriveTune" not in actual:
+                        return False, ""
+                elif actual != src.read_bytes():
+                    return False, ""
+            else:
+                expected = _patched_mod_bytes(rel, src.read_bytes(), patch_tier=cur_tier)
+                if actual != expected:
+                    return False, ""
+
+    cur_py = sys.version_info.major * 100 + sys.version_info.minor
+    pyz_cands = [e for e in entries if e[5] == b"z"]
+    toc = {}
+    pz = b""
+    off = 0
+    if len(pyz_cands) == 1:
+        try:
+            pz = _read_entry_bytes(exe_bytes, start, pyz_cands[0])
+            off, _m, toc = _read_pyz_toc(pz)
+        except Exception:
+            return False, ""
+    has_tr_lua = _carchive_key(entry_map, MOD_TRAFFICREPORT_LUA) in entry_map
+    has_pyz_rep = ORIG_EARTHD_MODULE in toc and SERVER_REPORTER_MODULE in toc
+    if enable_reporter and py == cur_py:
+        if not (has_tr_lua and has_pyz_rep):
+            return False, ""
+        tr_actual = _read_entry_bytes(exe_bytes, start, entry_map[_carchive_key(entry_map, MOD_TRAFFICREPORT_LUA)])
+        if tr_actual != (payload_root / MOD_TRAFFICREPORT_LUA).read_bytes():
+            return False, ""
+        act_actual = _read_entry_bytes(exe_bytes, start, entry_map.get(_carchive_key(entry_map, MOD_ACTIONS_JSON)))
+        if REPORT_ACTION_KEY.encode("ascii") not in act_actual:
+            return False, ""
+        if pz[4:8] == importlib.util.MAGIC_NUMBER and SERVER_REPORTER_MODULE in toc:
+            rk, rp, rl = toc[SERVER_REPORTER_MODULE]
+            if rk == 0 and 12 <= rp and rp + rl <= off:
+                rco = marshal.loads(zlib.decompress(pz[rp:rp + rl]))
+                if VERSION not in repr(rco.co_consts):
+                    return False, ""
+    elif not enable_reporter:
+        if has_tr_lua or has_pyz_rep:
+            return False, ""
+    return True, cur_tier
+
+
 def patch_executable_with_tier(
     data,
     payload_dir,
@@ -972,7 +1231,11 @@ def patch_executable_with_tier(
     enable_reporter=False,
     payload_sha=None,
     require_mod_files=True,
+    backup_hint_bytes=None,
 ):
+    if _has_taf_footprint_in_exe(data):
+        data = _strip_taf_from_carchive_bytes(data, backup_exe_bytes=backup_hint_bytes)
+
     start, toff, cookie_pos, py, lib, entries = archive_entries(data)
     entry_map = {e[7]: e for e in entries}
     if require_mod_files:
@@ -1004,6 +1267,9 @@ def patch_executable_with_tier(
     payload_root = Path(payload_dir)
     eff_payload_sha = payload_sha if payload_sha is not None else _payload_digest(payload_dir)
     carchive_replacements = {}
+    embedded_mod_backups = {}
+    embedded_cid_backups = {}
+
     if enable_reporter and pyz_e is not None:
         cur_py = sys.version_info.major * 100 + sys.version_info.minor
         if py != cur_py:
@@ -1023,6 +1289,7 @@ def patch_executable_with_tier(
             if cache_key in entry_map:
                 orig_entry = entry_map[cache_key]
                 orig_id_raw = _read_entry_bytes(data, start, orig_entry)
+                embedded_cid_backups[cache_key] = orig_id_raw
                 salted_id_raw = _salt_carchive_cache_id(
                     orig_id_raw,
                     cache_key,
@@ -1034,6 +1301,11 @@ def patch_executable_with_tier(
                 carchive_replacements[cache_key] = (packed_id, len(salted_id_raw), orig_entry[4], orig_entry[5])
 
     if require_mod_files and (apply_fixes or enable_reporter):
+        for rel in MOD_FILES:
+            arc_key = _carchive_key(entry_map, rel)
+            if arc_key in entry_map:
+                embedded_mod_backups[rel] = _read_entry_bytes(data, start, entry_map[arc_key])
+
         target_files = (
             MOD_FILES
             if (apply_fixes and patch_tier == TIER_FULL_SOLVER)
@@ -1044,11 +1316,14 @@ def patch_executable_with_tier(
             if not src.is_file():
                 raise PatchError(f"Payload is missing mod file: {rel}")
             arc_key = _carchive_key(entry_map, rel)
-            upstream_bytes = _read_entry_bytes(data, start, entry_map.get(arc_key))
+            upstream_bytes = embedded_mod_backups.get(rel)
             raw_bytes = _patched_mod_bytes(
                 rel, src.read_bytes(), upstream_bytes=upstream_bytes, patch_tier=patch_tier
             )
             carchive_replacements[arc_key] = (zlib.compress(raw_bytes, 6), len(raw_bytes), 1, b"b")
+
+        emb_blob = _encode_embedded_taf_backup(embedded_mod_backups, embedded_cid_backups)
+        carchive_replacements[TAF_CARCHIVE_BACKUP_KEY] = (emb_blob, len(emb_blob), 0, b"b")
 
     if require_mod_files and enable_reporter:
         tr_src = payload_root / MOD_TRAFFICREPORT_LUA
@@ -1135,86 +1410,13 @@ def _cleanup_stale_stage(state_dir, previous):
         shutil.rmtree(p, ignore_errors=True)
 
 
-def _splice_original_mod_files(current_exe_bytes, backup_exe_bytes):
-    """Restore Traffic and AutoDrive fixes entries into current_exe_bytes while preserving stacked sibling add-ons."""
-    c_start, _c_toff, c_cookie_pos, c_py, c_lib, c_entries = archive_entries(current_exe_bytes)
-    b_start, _b_toff, _b_cookie_pos, _b_py, _b_lib, b_entries = archive_entries(backup_exe_bytes)
-    c_map = {e[7]: e for e in c_entries}
-    b_map = {e[7]: e for e in b_entries}
-    marker_entry = c_map.get(_carchive_key(c_map, MOD_MARKER_FILE))
-    if marker_entry is None or not _has_taf_marker(_read_entry_bytes(current_exe_bytes, c_start, marker_entry)):
+def _splice_original_mod_files(current_exe_bytes, backup_exe_bytes=None):
+    """Restore Traffic and AutoDrive fixes entries while preserving stacked sibling add-ons."""
+    if not _has_taf_footprint_in_exe(current_exe_bytes):
         return None
-    brf_bug_key = _carchive_key(c_map, "mod/beamng_earth/lua/ge/extensions/beamngEarth/bugreport.lua")
-    has_brf = b"EARTH_BRIDGE_RAIL_FIXES_" in current_exe_bytes or brf_bug_key in c_map
-    if not has_brf:
-        c_pyz = [e for e in c_entries if e[5] == b"z"]
-        if len(c_pyz) == 1:
-            try:
-                pz_chk = _read_entry_bytes(current_exe_bytes, c_start, c_pyz[0])
-                _, _, toc_chk = _read_pyz_toc(pz_chk)
-                has_brf = "bridge_rail_report" in toc_chk or "_brf_orig_earthd" in toc_chk
-            except Exception:
-                has_brf = False
-    if not has_brf:
+    if not _has_brf_footprint_in_exe(current_exe_bytes) and backup_exe_bytes is not None:
         return None
-    mod_arc_keys = {_carchive_key(b_map, rel) for rel in MOD_FILES}
-    if not mod_arc_keys.issubset(b_map):
-        return None
-    tr_arc_key = _carchive_key(c_map, MOD_TRAFFICREPORT_LUA)
-    act_arc_key = _carchive_key(c_map, MOD_ACTIONS_JSON)
-    key_arc_key = _carchive_key(c_map, MOD_KEYMAP_JSON)
-    ms_arc_key = _carchive_key(c_map, MOD_SCRIPT_LUA)
-
-    c_cookie_end = c_cookie_pos + COOKIE.size
-    header, _signed, checksum_at = strip_signature(current_exe_bytes, c_cookie_end)
-    new_body = bytearray()
-    new_toc = bytearray()
-    for n, pos, length, raw, comp, kind, namebytes, name in c_entries:
-        if name == tr_arc_key and name not in b_map:
-            continue
-        out_pos = len(new_body)
-        if name in mod_arc_keys:
-            be = b_map[name]
-            chunk = backup_exe_bytes[b_start + be[1]:b_start + be[1] + be[2]]
-            new_body.extend(chunk)
-            new_toc.extend(ENTRY.pack(n, out_pos, be[2], be[3], be[4], be[5]) + namebytes)
-        elif kind == b"z":
-            pz_cur = _read_entry_bytes(current_exe_bytes, c_start, (n, pos, length, raw, comp, kind, namebytes, name))
-            pz_un = unpatch_pyz_for_reporter(pz_cur)
-            if pz_un != pz_cur:
-                chunk = zlib.compress(pz_un, 6) if comp else pz_un
-                new_body.extend(chunk)
-                new_toc.extend(ENTRY.pack(n, out_pos, len(chunk), len(pz_un), comp, kind) + namebytes)
-            else:
-                chunk = bytes(header[c_start + pos:c_start + pos + length])
-                new_body.extend(chunk)
-                new_toc.extend(ENTRY.pack(n, out_pos, length, raw, comp, kind) + namebytes)
-        elif name in (act_arc_key, key_arc_key, ms_arc_key):
-            cur_raw = _read_entry_bytes(current_exe_bytes, c_start, (n, pos, length, raw, comp, kind, namebytes, name))
-            if name == act_arc_key:
-                un_raw = unpatch_actions_json_bytes(cur_raw)
-            elif name == key_arc_key:
-                un_raw = unpatch_keymap_json_bytes(cur_raw)
-            else:
-                un_raw = unpatch_modscript_bytes(cur_raw)
-            chunk = zlib.compress(un_raw, 6) if comp else un_raw
-            new_body.extend(chunk)
-            new_toc.extend(ENTRY.pack(n, out_pos, len(chunk), len(un_raw), comp, kind) + namebytes)
-        else:
-            chunk = bytes(header[c_start + pos:c_start + pos + length])
-            new_body.extend(chunk)
-            new_toc.extend(ENTRY.pack(n, out_pos, length, raw, comp, kind) + namebytes)
-    cookie = COOKIE.pack(MAGIC, len(new_body) + len(new_toc) + COOKIE.size, len(new_body), len(new_toc), c_py, c_lib)
-    new_carchive = new_body + new_toc + cookie
-    if current_exe_bytes[:4] == b"\x7fELF":
-        result_bytes = _rebuild_elf64_with_carchive(current_exe_bytes, c_start, c_cookie_end, new_carchive)
-    else:
-        result = bytearray(header[:c_start]) + new_carchive
-        if checksum_at is not None:
-            struct.pack_into("<I", result, checksum_at, pe_checksum(result, checksum_at))
-        result_bytes = bytes(result)
-    archive_entries(result_bytes)
-    return result_bytes
+    return _strip_taf_from_carchive_bytes(current_exe_bytes, backup_exe_bytes=backup_exe_bytes)
 
 
 def _copy_file_mode_safe(src, dst):
@@ -1222,6 +1424,80 @@ def _copy_file_mode_safe(src, dst):
         shutil.copymode(src, dst)
     except OSError:
         pass
+
+
+def _write_backup_atomic(backup_path, raw_bytes, mode_ref=None):
+    tmp = backup_path.with_name(f"{backup_path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_bytes(raw_bytes)
+    if mode_ref is not None:
+        _copy_file_mode_safe(mode_ref, tmp)
+    os.replace(tmp, backup_path)
+
+
+def _exe_is_authenticode_signed(data):
+    if not data:
+        return False
+    try:
+        _start, _toff, cookie_pos, _py, _lib, _entries = archive_entries(data)
+        _out, signed, _cs = strip_signature(data, cookie_pos + COOKIE.size)
+        return bool(signed)
+    except Exception:
+        return False
+
+
+def _same_earth_build_carchive(a_bytes, b_bytes):
+    """Return True if two PyInstaller binaries belong to the exact same upstream BeamNG.Earth build."""
+    if not a_bytes or not b_bytes:
+        return False
+    try:
+        a_start, _at, _ac, a_py, _al, a_entries = archive_entries(a_bytes)
+        b_start, _bt, _bc, b_py, _bl, b_entries = archive_entries(b_bytes)
+    except PatchError:
+        return False
+    if a_py != b_py:
+        return False
+    a_map = {e[7]: e for e in a_entries}
+    b_map = {e[7]: e for e in b_entries}
+    if _read_carchive_version(a_bytes, a_start, a_map) != _read_carchive_version(b_bytes, b_start, b_map):
+        return False
+    if "base_library.zip" in a_map and "base_library.zip" in b_map:
+        ae, be = a_map["base_library.zip"], b_map["base_library.zip"]
+        return a_bytes[a_start + ae[1]:a_start + ae[1] + ae[2]] == b_bytes[b_start + be[1]:b_start + be[1] + be[2]]
+    a_pyz = [e for e in a_entries if e[5] == b"z"]
+    b_pyz = [e for e in b_entries if e[5] == b"z"]
+    if len(a_pyz) == 1 and len(b_pyz) == 1:
+        try:
+            apz = _read_entry_bytes(a_bytes, a_start, a_pyz[0])
+            bpz = _read_entry_bytes(b_bytes, b_start, b_pyz[0])
+            _, _, atoc = _read_pyz_toc(apz)
+            _, _, btoc = _read_pyz_toc(bpz)
+            for ref_mod in ("fast", "areaprops"):
+                if ref_mod in atoc and ref_mod in btoc:
+                    ak, ap, al = atoc[ref_mod]
+                    bk, bp, bl = btoc[ref_mod]
+                    if (ak, al) != (bk, bl) or apz[ap:ap + al] != bpz[bp:bp + bl]:
+                        return False
+            return True
+        except Exception:
+            return False
+    return True
+
+
+def _find_pristine_sibling_backup(target, ref_bytes):
+    sib_backup = target.with_name(target.name + ".earthBridgeRailFixes.original")
+    if not sib_backup.is_file():
+        return None
+    try:
+        raw = sib_backup.read_bytes()
+    except OSError:
+        return None
+    if (
+        not _has_taf_footprint_in_exe(raw)
+        and not _has_brf_footprint_in_exe(raw)
+        and _same_earth_build_carchive(raw, ref_bytes)
+    ):
+        return raw
+    return None
 
 
 def _prepare_exe(target, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter=False):
@@ -1232,79 +1508,216 @@ def _prepare_exe(target, config, status, payload_dir, operation, token, server_p
     digest = sha256_bytes(before)
     original_sha = digest
     payload_sha = _payload_digest(payload_dir) if payload_dir is not None else previous.get("payloadSha", "")
+    backup_bytes = backup.read_bytes() if backup.is_file() else None
+    backup_valid_for_prev = bool(
+        backup_bytes is not None
+        and previous.get("originalSha")
+        and sha256_bytes(backup_bytes) == previous.get("originalSha")
+    )
 
     if operation == "restore":
-        if not previous:
-            raise PatchError("No recorded Traffic and AutoDrive fixes patch for this executable")
-        if digest == previous.get("originalSha"):
+        has_taf = _has_taf_footprint_in_exe(before)
+        if not has_taf:
+            if not previous and not backup.is_file():
+                raise PatchError("No recorded Traffic and AutoDrive fixes patch for this executable")
             _cleanup_stale_pending(target, previous)
-            record = dict(previous, state="restored", message="Original executable is already active.", token=token)
+            record = dict(
+                previous,
+                version=VERSION,
+                mode="exe",
+                state="restored",
+                operation="restore",
+                target=str(target),
+                sidecar=str(sidecar),
+                status=str(status),
+                config=str(config),
+                message="Original executable is already active.",
+                token=token,
+            )
             atomic_json(sidecar, record)
             atomic_json(status, record)
             return record
-        if not backup.is_file() or sha256_bytes(backup.read_bytes()) != previous.get("originalSha"):
-            raise PatchError("Original executable backup is missing or checksum-mismatched")
-        backup_bytes = backup.read_bytes()
-        orig_cache_ids = dict(previous.get("originalCacheIds") or _read_carchive_cache_ids(backup_bytes))
-        salted_cache_ids = dict(previous.get("saltedCacheIds") or {})
-        if digest != previous.get("patchedSha"):
-            spliced = _splice_original_mod_files(before, backup_bytes)
-            if spliced is None:
-                raise PatchError("Executable changed after patching; restoration aborted to protect updates")
-            after = spliced
-            original_sha = previous["originalSha"]
-            signed = False
-        else:
-            original_sha = previous["originalSha"]
-            after = backup_bytes
-            if orig_cache_ids and _read_carchive_cache_ids(after) != orig_cache_ids:
-                raise PatchError("Restored executable cache IDs do not match recorded originals")
-            signed = previous.get("originalSigned", False)
-    else:
-        pristine = before
-        if previous and digest == previous.get("patchedSha"):
-            if (
-                str(config) == previous.get("config")
-                and previous.get("payloadSha") == payload_sha
-                and previous.get("applyFixes") == bool(apply_fixes)
-                and previous.get("enableReporter", False) == bool(enable_reporter)
-            ):
-                record = dict(
-                    previous,
-                    state="installed",
-                    message="Traffic and AutoDrive fixes are installed. Restart BeamNG.Earth if you changed options.",
-                    token=token,
-                    serverPid=server_pid,
-                )
-                atomic_json(sidecar, record)
-                atomic_json(status, record)
-                return record
-            if not backup.is_file() or sha256_bytes(backup.read_bytes()) != previous.get("originalSha"):
-                raise PatchError("Original executable backup could not be verified; existing patch preserved")
-            pristine = backup.read_bytes()
-            original_sha = previous["originalSha"]
-        elif backup.exists() and (
-            not previous
-            or sha256_bytes(backup.read_bytes()) != previous.get("originalSha")
-            or digest != previous.get("originalSha")
-        ):
-            raise PatchError("Existing backup belongs to a different Earth build; it was preserved")
 
-        orig_cache_ids = _read_carchive_cache_ids(pristine)
-        after, signed, patch_tier = patch_executable_with_tier(
-            pristine,
+        has_brf = _has_brf_footprint_in_exe(before)
+        same_build_pristine = (
+            backup_bytes
+            if (
+                backup_bytes is not None
+                and not _has_taf_footprint_in_exe(backup_bytes)
+                and not _has_brf_footprint_in_exe(backup_bytes)
+                and _same_earth_build_carchive(backup_bytes, before)
+            )
+            else _find_pristine_sibling_backup(target, before)
+        )
+        if (
+            backup_bytes is not None
+            and backup_valid_for_prev
+            and digest == previous.get("patchedSha")
+            and (not has_brf or _has_brf_footprint_in_exe(backup_bytes))
+        ):
+            after = backup_bytes
+            original_sha = previous["originalSha"]
+            orig_cache_ids = dict(previous.get("originalCacheIds") or _read_carchive_cache_ids(after))
+            salted_cache_ids = dict(previous.get("saltedCacheIds") or {})
+            signed = bool(previous.get("originalSigned")) or _exe_is_authenticode_signed(after)
+        elif not has_brf and same_build_pristine is not None:
+            if (
+                backup_bytes is same_build_pristine
+                and previous.get("originalSha")
+                and sha256_bytes(backup_bytes) != previous.get("originalSha")
+            ):
+                raise PatchError("Original executable backup is missing or checksum-mismatched")
+            after = same_build_pristine
+            original_sha = sha256_bytes(after)
+            orig_cache_ids = dict(previous.get("originalCacheIds") or _read_carchive_cache_ids(after))
+            salted_cache_ids = dict(previous.get("saltedCacheIds") or {})
+            signed = bool(previous.get("originalSigned")) or _exe_is_authenticode_signed(after)
+        else:
+            eff_backup_hint = (
+                backup_bytes
+                if (backup_bytes is not None and _same_earth_build_carchive(backup_bytes, before))
+                else same_build_pristine
+            )
+            after = _strip_taf_from_carchive_bytes(before, backup_exe_bytes=eff_backup_hint)
+            original_sha = (
+                previous["originalSha"]
+                if backup_valid_for_prev
+                else (sha256_bytes(same_build_pristine) if same_build_pristine is not None else sha256_bytes(after))
+            )
+            orig_cache_ids = dict(previous.get("originalCacheIds") or _read_carchive_cache_ids(eff_backup_hint or after))
+            salted_cache_ids = dict(previous.get("saltedCacheIds") or {})
+            signed = bool(previous.get("originalSigned")) or _exe_is_authenticode_signed(same_build_pristine)
+        patch_tier = previous.get("patchTier", TIER_FULL_SOLVER)
+    else:
+        already_ok, cur_tier = _exe_matches_desired_install(
+            before, payload_dir, apply_fixes=apply_fixes, enable_reporter=enable_reporter
+        )
+        pristine_ref = (
+            backup_bytes
+            if (
+                backup_bytes is not None
+                and not _has_taf_footprint_in_exe(backup_bytes)
+                and not _has_brf_footprint_in_exe(backup_bytes)
+                and _same_earth_build_carchive(backup_bytes, before)
+            )
+            else _find_pristine_sibling_backup(target, before)
+        )
+        if already_ok:
+            _cleanup_stale_pending(target, previous)
+            if not backup.is_file() and pristine_ref is not None:
+                _write_backup_atomic(backup, pristine_ref, mode_ref=target)
+                backup_bytes = pristine_ref
+                original_sha = sha256_bytes(pristine_ref)
+            elif not backup.is_file() and not _has_brf_footprint_in_exe(before):
+                reconstructed = _strip_taf_from_carchive_bytes(before, backup_exe_bytes=None)
+                _write_backup_atomic(backup, reconstructed, mode_ref=target)
+                backup_bytes = reconstructed
+                original_sha = sha256_bytes(reconstructed)
+            elif pristine_ref is not None:
+                original_sha = sha256_bytes(pristine_ref)
+            elif backup_valid_for_prev:
+                original_sha = previous["originalSha"]
+            elif backup_bytes is not None:
+                original_sha = sha256_bytes(backup_bytes)
+            else:
+                original_sha = previous.get("originalSha", digest)
+            orig_signed_val = (
+                bool(previous["originalSigned"])
+                if "originalSigned" in previous
+                else _exe_is_authenticode_signed(pristine_ref if pristine_ref is not None else backup_bytes)
+            )
+            record = {
+                "version": VERSION,
+                "mode": "exe",
+                "state": "installed",
+                "operation": "install",
+                "patchTier": cur_tier,
+                "target": str(target),
+                "backup": str(backup),
+                "pending": "",
+                "expectedSha": digest,
+                "replacementSha": digest,
+                "originalSha": original_sha,
+                "patchedSha": digest,
+                "payloadSha": payload_sha,
+                "originalSigned": orig_signed_val,
+                "originalCacheIds": previous.get("originalCacheIds") or (
+                    _read_carchive_cache_ids(pristine_ref if pristine_ref is not None else backup_bytes)
+                    if (pristine_ref is not None or backup_bytes is not None)
+                    else {}
+                ),
+                "saltedCacheIds": _read_carchive_cache_ids(before),
+                "applyFixes": bool(apply_fixes),
+                "enableReporter": bool(enable_reporter),
+                "sidecar": str(sidecar),
+                "status": str(status),
+                "config": str(config),
+                "token": token,
+                "serverPid": server_pid,
+                "message": "Traffic and AutoDrive fixes are installed.",
+            }
+            atomic_json(sidecar, record)
+            atomic_json(status, record)
+            return record
+
+        has_taf = _has_taf_footprint_in_exe(before)
+        has_brf = _has_brf_footprint_in_exe(before)
+        if has_taf:
+            if not has_brf and backup_valid_for_prev and _same_earth_build_carchive(backup_bytes, before):
+                base_input = backup_bytes
+                original_sha = previous["originalSha"]
+            else:
+                eff_backup_hint = (
+                    backup_bytes
+                    if (backup_bytes is not None and _same_earth_build_carchive(backup_bytes, before))
+                    else pristine_ref
+                )
+                base_input = _strip_taf_from_carchive_bytes(before, backup_exe_bytes=eff_backup_hint)
+                if pristine_ref is not None and (not backup.is_file() or backup_bytes != pristine_ref):
+                    _write_backup_atomic(backup, pristine_ref, mode_ref=target)
+                    backup_bytes = pristine_ref
+                    original_sha = sha256_bytes(pristine_ref)
+                elif not backup.is_file() and not has_brf:
+                    _write_backup_atomic(backup, base_input, mode_ref=target)
+                    backup_bytes = base_input
+                    original_sha = sha256_bytes(base_input)
+                elif backup_valid_for_prev:
+                    original_sha = previous["originalSha"]
+                elif backup_bytes is not None:
+                    original_sha = sha256_bytes(backup_bytes)
+                else:
+                    original_sha = sha256_bytes(base_input)
+        else:
+            base_input = before
+            sib_pristine = _find_pristine_sibling_backup(target, before) if has_brf else None
+            if sib_pristine is not None:
+                if not backup.is_file() or sha256_bytes(backup_bytes) != sha256_bytes(sib_pristine):
+                    _write_backup_atomic(backup, sib_pristine, mode_ref=target)
+                    backup_bytes = sib_pristine
+                original_sha = sha256_bytes(sib_pristine)
+            elif not has_brf or not backup.is_file():
+                if not backup.is_file() or not backup_valid_for_prev or digest != previous.get("originalSha"):
+                    _write_backup_atomic(backup, before, mode_ref=target)
+                    backup_bytes = before
+                original_sha = sha256_bytes(backup_bytes)
+            else:
+                original_sha = previous.get("originalSha") or sha256_bytes(backup_bytes)
+
+        orig_cache_ids = _read_carchive_cache_ids(backup_bytes if backup_bytes is not None else base_input)
+        after, signed_patch, patch_tier = patch_executable_with_tier(
+            base_input,
             payload_dir,
             apply_fixes=apply_fixes,
             enable_reporter=enable_reporter,
             payload_sha=payload_sha,
+            backup_hint_bytes=backup_bytes,
+        )
+        signed = (
+            bool(previous["originalSigned"])
+            if "originalSigned" in previous
+            else (_exe_is_authenticode_signed(backup_bytes) if backup_bytes is not None else signed_patch)
         )
         salted_cache_ids = _read_carchive_cache_ids(after)
-        if not backup.exists():
-            with backup.open("xb") as stream:
-                stream.write(pristine)
-            _copy_file_mode_safe(target, backup)
-        if sha256_bytes(backup.read_bytes()) != original_sha:
-            raise PatchError("Backup verification failed; original executable untouched")
 
     _cleanup_stale_pending(target, previous)
     pending = target.with_name(f"{target.name}.{TAG}.{uuid.uuid4().hex}.pending")
@@ -1314,7 +1727,7 @@ def _prepare_exe(target, config, status, payload_dir, operation, token, server_p
     if sha256_bytes(pending.read_bytes()) != sha256_bytes(after):
         raise PatchError("Staged patch checksum verification failed")
 
-    patched_sha = sha256_bytes(after) if operation == "install" else previous["patchedSha"]
+    patched_sha = sha256_bytes(after) if operation == "install" else previous.get("patchedSha", "")
     eff_tier = patch_tier if operation == "install" else previous.get("patchTier", TIER_FULL_SOLVER)
     record = {
         "version": VERSION,
@@ -1363,6 +1776,30 @@ def _unpatch_shared_source_file(rel, cur_bytes):
     return None
 
 
+def _source_matches_desired_install(root, planned):
+    for rel, expected_bytes in planned:
+        dest = root / rel
+        if not dest.is_file():
+            return False
+        cur = dest.read_bytes()
+        if rel in REPORTER_SHARED_MOD_FILES:
+            if rel == MOD_ACTIONS_JSON and REPORT_ACTION_KEY.encode("ascii") not in cur:
+                return False
+            if rel == MOD_KEYMAP_JSON and REPORT_ACTION_KEY.encode("ascii") not in cur:
+                return False
+            if rel == MOD_SCRIPT_LUA and b"beamngEarth_trafficreport" not in cur:
+                return False
+        elif rel == "server/earthd.py":
+            if SERVER_REPORTER_MODULE.encode("ascii") not in cur and MARKER.encode("ascii") not in cur:
+                return False
+        elif cur != expected_bytes:
+            return False
+    if not any(r == MOD_TRAFFICREPORT_LUA for r, _ in planned):
+        if (root / MOD_TRAFFICREPORT_LUA).exists():
+            return False
+    return True
+
+
 def _prepare_source(root, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter=False):
     state_dir = root / f".{TAG}"
     sidecar = state_dir / "receipt.json"
@@ -1372,6 +1809,23 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
 
     if operation == "restore":
         if not previous or not previous.get("files"):
+            gps_f = root / MOD_MARKER_FILE
+            if gps_f.is_file() and not _has_taf_marker(gps_f.read_bytes()):
+                record = {
+                    "version": VERSION,
+                    "mode": "source",
+                    "state": "restored",
+                    "operation": "restore",
+                    "target": str(root),
+                    "sidecar": str(sidecar),
+                    "status": str(status),
+                    "config": str(config),
+                    "token": token,
+                    "message": "Original source files are already active.",
+                }
+                atomic_json(sidecar, record)
+                atomic_json(status, record)
+                return record
             raise PatchError("No recorded Traffic and AutoDrive fixes source patch for this folder")
         items = []
         up_to_date = True
@@ -1382,12 +1836,11 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
             if entry["added"]:
                 if dest.exists():
                     up_to_date = False
-                    if sha256_bytes(dest.read_bytes()) != entry["patchedSha"]:
-                        raise PatchError(f"{rel} changed after patching; restoration aborted")
+                    cur_sha = sha256_bytes(dest.read_bytes())
                     items.append({
                         "rel": rel,
                         "action": "delete",
-                        "expectedSha": entry["patchedSha"],
+                        "expectedSha": cur_sha,
                         "replacementSha": "",
                         "staged": "",
                     })
@@ -1492,15 +1945,17 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
             raise PatchError(f"Payload is missing {MOD_TRAFFICREPORT_LUA}")
 
         def _base_shared(rel):
-            bfile = backup_dir / rel
             cur = root / rel
-            if bfile.is_file():
-                cur_b = cur.read_bytes() if cur.is_file() else b""
-                prev_map = {e["rel"]: e for e in previous.get("files", [])}
-                pe = prev_map.get(rel)
-                if pe and cur_b and sha256_bytes(cur_b) == pe.get("patchedSha"):
-                    return bfile.read_bytes()
-            return cur.read_bytes()
+            cur_b = cur.read_bytes()
+            if rel == MOD_ACTIONS_JSON:
+                return unpatch_actions_json_bytes(cur_b)
+            if rel == MOD_KEYMAP_JSON:
+                return unpatch_keymap_json_bytes(cur_b)
+            if rel == MOD_SCRIPT_LUA:
+                return unpatch_modscript_bytes(cur_b)
+            if rel == "server/earthd.py":
+                return unpatch_source_earthd_bytes(cur_b)
+            return cur_b
 
         planned.append((f"server/{SERVER_REPORTER_MODULE}.py", rep_py.read_bytes()))
         planned.append((MOD_TRAFFICREPORT_LUA, tr_lua.read_bytes()))
@@ -1514,24 +1969,29 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
             planned.append((f"server/{ORIG_EARTHD_MODULE}.py", earthd_base))
             planned.append(("server/earthd.py", _build_taf_earthd_wrapper_src(patch_tier=patch_tier).encode("utf-8")))
 
-    if (
-        previous
-        and previous.get("state") == "installed"
-        and previous.get("payloadSha") == payload_sha
-        and previous.get("applyFixes") == bool(apply_fixes)
-        and previous.get("enableReporter", False) == bool(enable_reporter)
-    ):
-        matches = True
-        for entry in previous.get("files", []):
-            dest = root / entry["rel"]
-            if not dest.is_file() or sha256_bytes(dest.read_bytes()) != entry["patchedSha"]:
-                matches = False
-                break
-        if matches:
-            record = dict(previous, token=token, serverPid=server_pid, message="Traffic and AutoDrive fixes are already active in this source checkout.")
-            atomic_json(sidecar, record)
-            atomic_json(status, record)
-            return record
+    if _source_matches_desired_install(root, planned):
+        _cleanup_stale_stage(state_dir, previous)
+        record = dict(
+            previous,
+            version=VERSION,
+            mode="source",
+            state="installed",
+            operation="install",
+            patchTier=patch_tier,
+            target=str(root),
+            sidecar=str(sidecar),
+            status=str(status),
+            config=str(config),
+            token=token,
+            serverPid=server_pid,
+            payloadSha=payload_sha,
+            applyFixes=bool(apply_fixes),
+            enableReporter=bool(enable_reporter),
+            message="Traffic and AutoDrive fixes are already active in this source checkout.",
+        )
+        atomic_json(sidecar, record)
+        atomic_json(status, record)
+        return record
 
     _cleanup_stale_stage(state_dir, previous)
     stage_dir = state_dir / f"stage-{uuid.uuid4().hex}"
@@ -1544,27 +2004,36 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
     for rel, new_bytes in planned:
         dest = root / rel
         prev_entry = prev_entries.get(rel)
+        cur_exists = dest.is_file()
+        cur_bytes = dest.read_bytes() if cur_exists else b""
+        cur_sha = sha256_bytes(cur_bytes) if cur_exists else ""
         if prev_entry and not prev_entry["added"]:
             bfile = backup_dir / rel
-            if not bfile.is_file() or sha256_bytes(bfile.read_bytes()) != prev_entry["originalSha"]:
-                raise PatchError(f"Backup could not be verified for {rel}")
-            if not dest.is_file() or sha256_bytes(dest.read_bytes()) != prev_entry["patchedSha"]:
-                raise PatchError(f"{rel} changed since previous patch; restore first before re-patching")
-            orig_sha = prev_entry["originalSha"]
+            if bfile.is_file() and sha256_bytes(bfile.read_bytes()) == prev_entry["originalSha"]:
+                orig_sha = prev_entry["originalSha"]
+            else:
+                orig_sha = cur_sha
+                bfile.parent.mkdir(parents=True, exist_ok=True)
+                bfile.write_bytes(cur_bytes)
             added = False
-            expected_sha = prev_entry["patchedSha"]
+            expected_sha = cur_sha
         elif prev_entry and prev_entry["added"]:
             orig_sha = ""
             added = True
-            expected_sha = sha256_bytes(dest.read_bytes()) if dest.is_file() else ""
-        elif dest.is_file():
-            orig_bytes = dest.read_bytes()
+            expected_sha = cur_sha
+        elif cur_exists:
+            orig_bytes = _unpatch_shared_source_file(rel, cur_bytes) or _strip_existing_taf_marker_lines(cur_bytes)
+            if rel == MOD_SETTINGS_LUA:
+                orig_bytes = unpatch_settings_lua_bytes(orig_bytes)
             orig_sha = sha256_bytes(orig_bytes)
             bfile = backup_dir / rel
-            bfile.parent.mkdir(parents=True, exist_ok=True)
-            bfile.write_bytes(orig_bytes)
+            if not bfile.is_file():
+                bfile.parent.mkdir(parents=True, exist_ok=True)
+                bfile.write_bytes(orig_bytes)
+            else:
+                orig_sha = sha256_bytes(bfile.read_bytes())
             added = False
-            expected_sha = orig_sha
+            expected_sha = cur_sha
         else:
             orig_sha = ""
             added = True
@@ -1603,14 +2072,28 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
                 })
         else:
             bfile = backup_dir / prev_rel
-            if bfile.is_file() and sha256_bytes(bfile.read_bytes()) == prev_entry["originalSha"]:
-                items.append({
-                    "rel": prev_rel,
-                    "action": "write",
-                    "expectedSha": sha256_bytes(dest.read_bytes()) if dest.is_file() else "",
-                    "replacementSha": prev_entry["originalSha"],
-                    "staged": str(bfile),
-                })
+            if dest.is_file():
+                cur_b = dest.read_bytes()
+                spliced = _unpatch_shared_source_file(prev_rel, cur_b)
+                if spliced is not None:
+                    sfile = stage_dir / prev_rel
+                    sfile.parent.mkdir(parents=True, exist_ok=True)
+                    sfile.write_bytes(spliced)
+                    items.append({
+                        "rel": prev_rel,
+                        "action": "write",
+                        "expectedSha": sha256_bytes(cur_b),
+                        "replacementSha": sha256_bytes(spliced),
+                        "staged": str(sfile),
+                    })
+                elif bfile.is_file() and sha256_bytes(bfile.read_bytes()) == prev_entry["originalSha"]:
+                    items.append({
+                        "rel": prev_rel,
+                        "action": "write",
+                        "expectedSha": sha256_bytes(cur_b),
+                        "replacementSha": prev_entry["originalSha"],
+                        "staged": str(bfile),
+                    })
 
     record = {
         "version": VERSION,
@@ -1638,7 +2121,12 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
 
 
 def _clean_posix_env():
-    env = dict(os.environ)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("_PYI_", "_MEIPASS"))
+        and k not in ("PYTHONHOME", "PYTHONPATH", "TCL_LIBRARY", "TK_LIBRARY", "BNGEARTH_PARENT")
+    }
     if "LD_LIBRARY_PATH_ORIG" in env:
         orig_ld = env.pop("LD_LIBRARY_PATH_ORIG")
         if orig_ld:
@@ -1647,9 +2135,6 @@ def _clean_posix_env():
             env.pop("LD_LIBRARY_PATH", None)
     elif getattr(sys, "frozen", False):
         env.pop("LD_LIBRARY_PATH", None)
-    if getattr(sys, "frozen", False):
-        env.pop("PYTHONHOME", None)
-        env.pop("PYTHONPATH", None)
     return env
 
 
@@ -2011,16 +2496,6 @@ def _inspect_extracted_appdir(appdir_root):
     if f"tier={TIER_CLIENT_AND_REPORTER}".encode("ascii") in gps_bytes:
         patch_tier = TIER_CLIENT_AND_REPORTER
     elif not patched:
-        if len(pz) >= 8 and pz[4:8] == importlib.util.MAGIC_NUMBER and "fast" in toc:
-            try:
-                k, p_off, p_len = toc["fast"]
-                if k == 0 and 12 <= p_off and p_off + p_len <= off:
-                    fast_co = marshal.loads(zlib.decompress(pz[p_off:p_off + p_len]))
-                    fast_min = _extract_fast_min_version_from_code(fast_co)
-                    if fast_min is not None and fast_min > MAX_SOLVER_FAST_VERSION:
-                        patch_tier = TIER_CLIENT_AND_REPORTER
-            except Exception:
-                pass
         ad_b = (internal_dir / MOD_AUTODRIVE_LUA).read_bytes()
         nav_b = (internal_dir / MOD_NAVGRAPH_LUA).read_bytes()
         if _mod_files_drifted(gps_bytes, ad_b, nav_b):
@@ -2245,6 +2720,7 @@ def _prepare_appimage(target, config, status, payload_dir, operation, token, ser
         return record
 
     pristine_path = target
+    refresh_appimage_backup = False
     if previous and digest == previous.get("patchedSha"):
         if (
             str(config) == previous.get("config")
@@ -2271,7 +2747,14 @@ def _prepare_appimage(target, config, status, payload_dir, operation, token, ser
         or sha256_file(backup) != previous.get("originalSha")
         or digest != previous.get("originalSha")
     ):
-        raise PatchError("Existing backup belongs to a different AppImage build; it was preserved")
+        cur_info = inspect_target(target)
+        if not cur_info.get("patched"):
+            refresh_appimage_backup = True
+        elif backup.is_file() and (not previous or sha256_file(backup) == previous.get("originalSha")):
+            pristine_path = backup
+            original_sha = sha256_file(backup)
+        else:
+            raise PatchError("Existing backup belongs to a different AppImage build; it was preserved")
 
     stage_parent = state_parent / f"appimg_work_{uuid.uuid4().hex[:8]}"
     stage_parent.mkdir(parents=True, exist_ok=True)
@@ -2288,7 +2771,7 @@ def _prepare_appimage(target, config, status, payload_dir, operation, token, ser
             enable_reporter=enable_reporter,
             payload_sha=payload_sha,
         )
-        if not backup.exists():
+        if not backup.exists() or refresh_appimage_backup:
             shutil.copy2(pristine_path, backup)
             try:
                 os.chmod(backup, 0o755)
@@ -2462,34 +2945,114 @@ def _prepare_host(target, mode, config, status, payload_dir, operation, token, s
     return record
 
 
+def _pid_alive_check(pid):
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = k32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return ctypes.get_last_error() == 5
+            try:
+                code = ctypes.c_uint32(0)
+                if k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return code.value == 259
+                return True
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return False
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.exists():
+        try:
+            txt = proc_stat.read_text(encoding="utf-8", errors="replace")
+            rparen = txt.rfind(")")
+            if rparen > 0 and txt[rparen + 2:rparen + 3] == "Z":
+                return False
+        except OSError:
+            pass
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def _acquire_patch_lock(resolved_target, timeout_s=60.0, stale_age_s=120.0):
+    target_hash = sha256_bytes(str(resolved_target).encode("utf-8"))[:12]
+    lock_path = Path(tempfile.gettempdir()) / f"bne_companion_patch_{target_hash}.lock"
+    deadline = time.monotonic() + timeout_s
+    acquired = False
+    while time.monotonic() < deadline:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, json.dumps({"pid": os.getpid(), "ts": time.time()}).encode("utf-8"))
+            finally:
+                os.close(fd)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                doc = read_json(lock_path, {})
+                ts = float(doc.get("ts") or 0.0)
+                lpid = int(doc.get("pid") or 0)
+                if (ts and (time.time() - ts) > stale_age_s) or (lpid > 0 and lpid != os.getpid() and not _pid_alive_check(lpid)):
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except Exception:
+                pass
+            time.sleep(0.05)
+    if not acquired:
+        raise PatchError("Timed out waiting for sibling add-on patch lock.")
+    try:
+        yield lock_path
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def prepare(target, config, status, payload_dir=None, operation="install", token="", server_pid=0,
             apply_fixes=True, enable_reporter=False):
     resolved_target, mode = _resolve_target_path(target)
     if not apply_fixes and not enable_reporter and operation == "install":
         operation = "restore"
-    if operation != "restore":
-        verify_compatibility(resolved_target)
-        if payload_dir is None:
-            raise PatchError("Payload directory is required for install")
-        payload_dir = Path(payload_dir).resolve(strict=True)
-    elif payload_dir is not None:
-        p = Path(payload_dir)
-        payload_dir = p.resolve() if p.exists() else None
-    if mode == "exe":
-        return _prepare_exe(
+    with _acquire_patch_lock(resolved_target):
+        if operation != "restore":
+            verify_compatibility(resolved_target)
+            if payload_dir is None:
+                raise PatchError("Payload directory is required for install")
+            payload_dir = Path(payload_dir).resolve(strict=True)
+        elif payload_dir is not None:
+            p = Path(payload_dir)
+            payload_dir = p.resolve() if p.exists() else None
+        if mode == "exe":
+            return _prepare_exe(
+                resolved_target, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter
+            )
+        if mode == "appimage":
+            return _prepare_appimage(
+                resolved_target, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter
+            )
+        if mode in ("host_dir", "host_zip"):
+            return _prepare_host(
+                resolved_target, mode, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter
+            )
+        return _prepare_source(
             resolved_target, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter
         )
-    if mode == "appimage":
-        return _prepare_appimage(
-            resolved_target, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter
-        )
-    if mode in ("host_dir", "host_zip"):
-        return _prepare_host(
-            resolved_target, mode, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter
-        )
-    return _prepare_source(
-        resolved_target, config, status, payload_dir, operation, token, server_pid, apply_fixes, enable_reporter
-    )
 
 
 def apply_now(record):
@@ -3109,6 +3672,169 @@ def discover_user_dirs(include_system=True, extra_paths=None, linux_home=None, x
     return out
 
 
+def _atomic_write_bytes(path, raw_bytes):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    tmp.write_bytes(raw_bytes)
+    os.replace(tmp, path)
+
+
+def _sync_unpacked_user_mod_dir(
+    mod_root,
+    payload_root,
+    state_root,
+    *,
+    operation="install",
+    apply_fixes=True,
+    enable_reporter=False,
+    patch_tier=TIER_FULL_SOLVER,
+):
+    mod_root = Path(mod_root)
+    if not mod_root.is_dir():
+        return False
+    norm_key = str(mod_root.resolve()).lower() if os.name == "nt" else str(mod_root.resolve())
+    dir_id = sha256_bytes(norm_key.encode("utf-8"))[:12]
+    bdir = Path(state_root) / "unpacked_mod_backups" / dir_id
+
+    shared_rels = [
+        (r.removeprefix("mod/beamng_earth/"), r)
+        for r in (MOD_TRAFFICREPORT_LUA, *REPORTER_SHARED_MOD_FILES)
+    ]
+
+    if operation == "restore":
+        for rel in MOD_FILES:
+            short = rel.removeprefix("mod/beamng_earth/")
+            dest = mod_root / short
+            bfile = bdir / short
+            meta = read_json(bdir / f"{short}.meta.json", {})
+            if bfile.is_file():
+                _atomic_write_bytes(dest, bfile.read_bytes())
+            elif meta and meta.get("existed") is False and dest.is_file():
+                dest.unlink(missing_ok=True)
+            elif dest.is_file():
+                cur_b = dest.read_bytes()
+                cleaned = _strip_existing_taf_marker_lines(cur_b)
+                if rel == MOD_SETTINGS_LUA:
+                    cleaned = unpatch_settings_lua_bytes(cleaned)
+                if cleaned != cur_b:
+                    _atomic_write_bytes(dest, cleaned)
+
+        for short, full_rel in shared_rels:
+            dest = mod_root / short
+            if not dest.is_file():
+                continue
+            if full_rel == MOD_TRAFFICREPORT_LUA:
+                dest.unlink(missing_ok=True)
+            elif full_rel == MOD_ACTIONS_JSON:
+                cur_b = dest.read_bytes()
+                bfile = bdir / short
+                if b"beamngEarth_quickBridgeRailReport" in cur_b or not bfile.is_file():
+                    _atomic_write_bytes(dest, unpatch_actions_json_bytes(cur_b))
+                else:
+                    _atomic_write_bytes(dest, bfile.read_bytes())
+            elif full_rel == MOD_KEYMAP_JSON:
+                cur_b = dest.read_bytes()
+                bfile = bdir / short
+                if b"beamngEarth_quickBridgeRailReport" in cur_b or not bfile.is_file():
+                    _atomic_write_bytes(dest, unpatch_keymap_json_bytes(cur_b))
+                else:
+                    _atomic_write_bytes(dest, bfile.read_bytes())
+            elif full_rel == MOD_SCRIPT_LUA:
+                cur_b = dest.read_bytes()
+                bfile = bdir / short
+                if b"beamngEarth_bugreport" in cur_b or not bfile.is_file():
+                    _atomic_write_bytes(dest, unpatch_modscript_bytes(cur_b))
+                else:
+                    _atomic_write_bytes(dest, bfile.read_bytes())
+
+        if bdir.is_dir():
+            shutil.rmtree(bdir, ignore_errors=True)
+        return True
+
+    if payload_root is None:
+        return False
+
+    bdir.mkdir(parents=True, exist_ok=True)
+    target_mod_rels = (
+        (MOD_MARKER_FILE,)
+        if (not apply_fixes or patch_tier == TIER_CLIENT_AND_REPORTER)
+        else MOD_FILES
+    )
+    for rel in target_mod_rels:
+        short = rel.removeprefix("mod/beamng_earth/")
+        src = payload_root / rel
+        if not src.is_file():
+            continue
+        dest = mod_root / short
+        bfile = bdir / short
+        meta_file = bdir / f"{short}.meta.json"
+        cur_bytes = dest.read_bytes() if dest.is_file() else None
+        is_pristine_cur = bool(
+            cur_bytes is not None
+            and not _has_taf_marker(cur_bytes)
+            and (rel != MOD_SETTINGS_LUA or b"function M.autodriveTune" not in cur_bytes)
+        )
+        if is_pristine_cur:
+            _atomic_write_bytes(bfile, cur_bytes)
+            atomic_json(meta_file, {"rel": short, "existed": True, "originalSha": sha256_bytes(cur_bytes)})
+        elif not meta_file.is_file():
+            atomic_json(meta_file, {"rel": short, "existed": dest.is_file(), "originalSha": ""})
+
+        upstream_b = bfile.read_bytes() if bfile.is_file() else cur_bytes
+        patched_b = _patched_mod_bytes(rel, src.read_bytes(), upstream_bytes=upstream_b, patch_tier=patch_tier)
+        if cur_bytes != patched_b:
+            _atomic_write_bytes(dest, patched_b)
+
+    if enable_reporter and all((mod_root / r.removeprefix("mod/beamng_earth/")).is_file() for r in REPORTER_SHARED_MOD_FILES):
+        for short, full_rel in shared_rels:
+            dest = mod_root / short
+            bfile = bdir / short
+            meta_file = bdir / f"{short}.meta.json"
+            if full_rel == MOD_TRAFFICREPORT_LUA:
+                src = payload_root / full_rel
+                if src.is_file():
+                    if not meta_file.is_file():
+                        atomic_json(meta_file, {"rel": short, "existed": False, "originalSha": ""})
+                    _atomic_write_bytes(dest, src.read_bytes())
+                continue
+            cur_b = dest.read_bytes()
+            if full_rel == MOD_ACTIONS_JSON:
+                clean_b = unpatch_actions_json_bytes(cur_b)
+                if not bfile.is_file():
+                    _atomic_write_bytes(bfile, clean_b)
+                    atomic_json(meta_file, {"rel": short, "existed": True, "originalSha": sha256_bytes(clean_b)})
+                _atomic_write_bytes(dest, patch_actions_json_bytes(cur_b))
+            elif full_rel == MOD_KEYMAP_JSON:
+                clean_b = unpatch_keymap_json_bytes(cur_b)
+                if not bfile.is_file():
+                    _atomic_write_bytes(bfile, clean_b)
+                    atomic_json(meta_file, {"rel": short, "existed": True, "originalSha": sha256_bytes(clean_b)})
+                _atomic_write_bytes(dest, patch_keymap_json_bytes(cur_b))
+            elif full_rel == MOD_SCRIPT_LUA:
+                clean_b = unpatch_modscript_bytes(cur_b)
+                if not bfile.is_file():
+                    _atomic_write_bytes(bfile, clean_b)
+                    atomic_json(meta_file, {"rel": short, "existed": True, "originalSha": sha256_bytes(clean_b)})
+                _atomic_write_bytes(dest, patch_modscript_bytes(cur_b))
+    elif not enable_reporter:
+        tr_dest = mod_root / MOD_TRAFFICREPORT_LUA.removeprefix("mod/beamng_earth/")
+        if tr_dest.is_file():
+            tr_dest.unlink(missing_ok=True)
+        for full_rel, unpatch_fn in (
+            (MOD_ACTIONS_JSON, unpatch_actions_json_bytes),
+            (MOD_KEYMAP_JSON, unpatch_keymap_json_bytes),
+            (MOD_SCRIPT_LUA, unpatch_modscript_bytes),
+        ):
+            dest = mod_root / full_rel.removeprefix("mod/beamng_earth/")
+            if dest.is_file():
+                cur_b = dest.read_bytes()
+                un_b = unpatch_fn(cur_b)
+                if un_b != cur_b:
+                    _atomic_write_bytes(dest, un_b)
+    return True
+
+
 def sync_discovered_user_mods(
     payload_dir,
     state_root,
@@ -3119,13 +3845,26 @@ def sync_discovered_user_mods(
     enable_reporter=False,
     patch_tier=TIER_FULL_SOLVER,
 ):
-    """Sync or restore <user_dir>/mods/beamng_earth.zip when already staged in user_dir."""
+    """Sync or restore BOTH <user_dir>/mods/unpacked/beamng_earth/ and <user_dir>/mods/beamng_earth.zip."""
     payload_root = Path(payload_dir) if payload_dir else None
     state_root = Path(state_root)
     udirs = list(user_dirs) if user_dirs is not None else discover_user_dirs()
     synced = []
     for udir in udirs:
         udir = Path(udir)
+        unpacked_root = udir / "mods" / "unpacked" / "beamng_earth"
+        if unpacked_root.is_dir():
+            if _sync_unpacked_user_mod_dir(
+                unpacked_root,
+                payload_root,
+                state_root,
+                operation=operation,
+                apply_fixes=apply_fixes,
+                enable_reporter=enable_reporter,
+                patch_tier=patch_tier,
+            ):
+                synced.append(str(unpacked_root))
+
         mod_zip = udir / "mods" / "beamng_earth.zip"
         if not mod_zip.is_file():
             continue

@@ -5,7 +5,7 @@ local M = {}
 
 M.LEVEL_ID = 'beamng_earth'
 M.ADDON_ID = 'beamng-earth-autodrive-fixes'
-M.ADDON_VERSION = '0.1.1'
+M.ADDON_VERSION = '0.1.2'
 M.DIR = 'beamngEarth/traffic_autodrive_reports/'
 M.POLL_TIMEOUT_S = 22
 M.FIX_NOTIFY_SETTLE_S = 3.0

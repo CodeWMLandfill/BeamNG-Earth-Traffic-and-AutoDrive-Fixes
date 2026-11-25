@@ -31,7 +31,7 @@ M.HALO_M = 0
 -- with it off, and 89 frames over 50 ms in PhysicsAndVLUA in one run (the traffic AI's planning on the longer graph).
 -- It is on here because far-ahead spawns (AHEAD_M, ONCOMING_M) need runway; set 0 to turn it off.
 M.FAST_HALO_M = 650
-M.FAST_HALO_MS = 24.5     -- (55 mph)
+M.FAST_HALO_MS = 13.4     -- (30 mph)
 -- An apply (or its signals' second step) waits for a light frame (governor roomFor: at most APPLY_ROOM_MS of streaming
 -- and other work spent in it, not a terrain commit's), APPLY_WAIT_FRAMES at most
 M.APPLY_ROOM_MS = 4.0
@@ -64,9 +64,9 @@ M.RESPAWN_M = { 60, 300 }   -- a respawned car goes this far (min, max) behind t
 -- (250 m sent cars respawned near a cut straight back again: traffic popping in and out, PR #493, OmdevShastri).
 -- A car respawned for a cut or for standing still is not respawned for those again within COOLDOWN_S (one that
 -- leaves the block's guard still is at once).
-M.CUT_M = 60
+M.CUT_M = 95
 M.CUT_S = 4
-M.CUT_FRESH_M = 95
+M.CUT_FRESH_M = 140
 -- ... and at least as far as the car needs to stop for it (its speed squared over 2 CUT_DECEL, CUT_STOP_M more): the
 -- AI plans to the end of the graph and brakes for the dead end long before 4 s from it; at 70 mph it braked from
 -- ~200 m and turned round across the lanes ahead of the player, every half minute on a motorway (GitHub #855 / #966)

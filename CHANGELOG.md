@@ -2,6 +2,13 @@
 
 All notable changes to **BeamNG.Earth - Traffic and AutoDrive fixes** are documented in this file.
 
+## [0.1.2] - 2026-11-25
+
+### Fixed
+- **Latest Dev Build Compatibility (`dev.594` / `dev.595`+):** Decouples client Lua/Vue mod patching from server `fast.MIN_VERSION` bumps so all 8 Traffic and AutoDrive fixes stay active across newer **BeamNG.Earth** dev builds, and syncs `<user_dir>/mods/unpacked/beamng_earth/` live on startup so fixes take effect immediately on the first launch of a new build.
+- **Arterial & Highway Cut U-Turn Prevention:** Lowers `FAST_HALO_MS` to `13.4 m/s` (`30 mph`) and widens `CUT_M` (`95 m`) and `CUT_FRESH_M` (`140 m`) so traffic on 30-54 mph arterials and highways keeps ahead route runway instead of executing sudden U-turns near tile boundaries.
+- **Resident Add-ons Status & Seamless Side-by-Side Stacking:** Keeps the companion add-on resident while **BeamNG.Earth** runs so the Add-ons status badge stays `running`, eliminates duplicate restart popups on dev updates, self-heals upgrades without receipt errors, and coordinates single-close atomic swaps when stacked alongside **Bridge, Rail & Tunnel Fixes**.
+
 ## [0.1.1] - 2026-11-25
 
 ### Added

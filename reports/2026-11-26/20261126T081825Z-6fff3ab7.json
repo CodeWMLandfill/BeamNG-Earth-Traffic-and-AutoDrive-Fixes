@@ -1,0 +1,179 @@
+{
+  "schemaVersion": 1,
+  "id": "20261126T081825Z-6fff3ab7",
+  "createdAt": "2026-11-26T08:18:25.952Z",
+  "lat": 40.530332,
+  "lon": -79.775275,
+  "kind": "autodrive",
+  "addonId": "beamng-earth-autodrive-fixes",
+  "summary": "In-game autodrive report @ 40.53033, -79.77527",
+  "note": "Captured with Ctrl+Shift+T silent 1-hotkey reporter (Traffic and AutoDrive fixes).",
+  "earthVersion": "1.10.1-beta.dev.607",
+  "addonVersion": "0.1.2",
+  "headingDeg": 98.24,
+  "altM": 368.32,
+  "speedMs": 0,
+  "camera": {
+    "forward": [
+      -0.6635,
+      0.6788,
+      -0.3148
+    ],
+    "pos": [
+      1250.5378,
+      2255.1849,
+      369.688
+    ]
+  },
+  "nearest": {
+    "drivingTelemetry": {
+      "roadEdge": {
+        "lanes": "-+",
+        "oneway": false,
+        "halfM": 3.3,
+        "limitMs": 24.59,
+        "latOffM": 1.9
+      },
+      "autodrive": {
+        "active": false,
+        "mode": "normal",
+        "nilWps": 87,
+        "remainingM": 5460
+      },
+      "overtake": {
+        "passes": 0
+      },
+      "nearbyTraffic": [
+        {
+          "aheadM": -5.58,
+          "alpha": 1,
+          "state": "active",
+          "speedMs": 7.68,
+          "sideM": -10.32
+        },
+        {
+          "aheadM": 80.78,
+          "alpha": 1,
+          "state": "active",
+          "speedMs": 17.06,
+          "sideM": 12.97
+        },
+        {
+          "aheadM": -91.57,
+          "alpha": 1,
+          "state": "active",
+          "speedMs": 16.46,
+          "sideM": 11.27
+        }
+      ],
+      "tune": {
+        "speedMph": 0,
+        "mode": "legal",
+        "pass": true,
+        "avoidHighways": false,
+        "aggression": 0.42,
+        "awareness": 0.35
+      }
+    },
+    "experimentalFlags": [
+      "roadSigns",
+      "expSurfaceOverlay",
+      "expNewSidewalks",
+      "expEuScenery",
+      "expDropRails",
+      "expEntranceFlares",
+      "expPriorityStops",
+      "expRoughDirt",
+      "expWearStrips",
+      "expGradeGuard",
+      "expPhotoSurface",
+      "expTerrainBumps",
+      "expCliffWalls",
+      "expTunnelLids",
+      "expSubseaTunnels",
+      "expAiTunnels",
+      "expRailCollide",
+      "expCatenary",
+      "expRailCrossings",
+      "expRailCurves",
+      "expCanadaLidar",
+      "expGenGround",
+      "expStaleRevisit"
+    ],
+    "addonId": "beamng-earth-autodrive-fixes"
+  },
+  "drivingTelemetry": {
+    "roadEdge": {
+      "lanes": "-+",
+      "oneway": false,
+      "halfM": 3.3,
+      "limitMs": 24.59,
+      "latOffM": 1.9
+    },
+    "autodrive": {
+      "active": false,
+      "mode": "normal",
+      "nilWps": 87,
+      "remainingM": 5460
+    },
+    "overtake": {
+      "passes": 0
+    },
+    "nearbyTraffic": [
+      {
+        "aheadM": -5.58,
+        "alpha": 1,
+        "state": "active",
+        "speedMs": 7.68,
+        "sideM": -10.32
+      },
+      {
+        "aheadM": 80.78,
+        "alpha": 1,
+        "state": "active",
+        "speedMs": 17.06,
+        "sideM": 12.97
+      },
+      {
+        "aheadM": -91.57,
+        "alpha": 1,
+        "state": "active",
+        "speedMs": 16.46,
+        "sideM": 11.27
+      }
+    ],
+    "tune": {
+      "speedMph": 0,
+      "mode": "legal",
+      "pass": true,
+      "avoidHighways": false,
+      "aggression": 0.42,
+      "awareness": 0.35
+    }
+  },
+  "experimentalFlags": [
+    "roadSigns",
+    "expSurfaceOverlay",
+    "expNewSidewalks",
+    "expEuScenery",
+    "expDropRails",
+    "expEntranceFlares",
+    "expPriorityStops",
+    "expRoughDirt",
+    "expWearStrips",
+    "expGradeGuard",
+    "expPhotoSurface",
+    "expTerrainBumps",
+    "expCliffWalls",
+    "expTunnelLids",
+    "expSubseaTunnels",
+    "expAiTunnels",
+    "expRailCollide",
+    "expCatenary",
+    "expRailCrossings",
+    "expRailCurves",
+    "expCanadaLidar",
+    "expGenGround",
+    "expStaleRevisit"
+  ]
+}

@@ -32,6 +32,7 @@ M.HALO_M = 0
 -- It is on here because far-ahead spawns (AHEAD_M, ONCOMING_M) need runway; set 0 to turn it off.
 M.FAST_HALO_M = 650
 M.FAST_HALO_MS = 13.4     -- (30 mph)
+M.HALO_RUNWAY_MIN_M = 180 -- minimum extension beyond phys for a cut to be treated as halo-backed rather than a hard dead end
 -- An apply (or its signals' second step) waits for a light frame (governor roomFor: at most APPLY_ROOM_MS of streaming
 -- and other work spent in it, not a terrain commit's), APPLY_WAIT_FRAMES at most
 M.APPLY_ROOM_MS = 4.0
@@ -521,15 +522,18 @@ function M.toNodes(g, b, edgeM, leftHand, yieldEvery, halo, fastHalo)
     end
     return t
   end
-  local cut, cutList = {}, {}
+  local cut, physCutOrder, hardDead, cutList = {}, {}, {}, {}
   for _, e in ipairs(g.edges) do
     step()
     local a, bb = e[1], e[2]
     for _, pair in ipairs({ { a, bb }, { bb, a } }) do
-      local k = pair[1]
-      if phys[k] and not phys[pair[2]] and g.nodes[pair[2]] and not cut[k] then
+      local k, other = pair[1], pair[2]
+      if keep[k] and not keep[other] and g.nodes[other] then
+        hardDead[k] = true
+      end
+      if phys[k] and not phys[other] and g.nodes[other] and not cut[k] then
         cut[k] = true
-        cutList[#cutList + 1] = { keep[k][1], keep[k][2] }
+        physCutOrder[#physCutOrder + 1] = k
       end
     end
     if keep[a] and keep[bb] and a ~= bb and not M.tooSteep(keep[a], keep[bb]) then
@@ -544,6 +548,44 @@ function M.toNodes(g, b, edgeM, leftHand, yieldEvery, halo, fastHalo)
         B.links[a] = edge
         ne = ne + 1
       end
+    end
+  end
+  local runwaySq = (M.HALO_RUNWAY_MIN_M or 180) ^ 2
+  local function hasHaloRunway(startId)
+    local root = nodes[startId]
+    if not root then return false end
+    local rx, ry = root.pos.x, root.pos.y
+    local q, seen, head = {}, { [startId] = true }, 1
+    for nb in pairs(root.links) do
+      if not phys[nb] and not seen[nb] then
+        seen[nb] = true
+        q[#q + 1] = nb
+      end
+    end
+    while head <= #q do
+      local u = q[head]
+      head = head + 1
+      local un = nodes[u]
+      if un then
+        local dx, dy = un.pos.x - rx, un.pos.y - ry
+        if dx * dx + dy * dy >= runwaySq then return true end
+        for nb in pairs(un.links) do
+          if not phys[nb] and not seen[nb] then
+            seen[nb] = true
+            q[#q + 1] = nb
+          end
+        end
+      end
+    end
+    return false
+  end
+  for _, k in ipairs(physCutOrder) do
+    cutList[#cutList + 1] = { keep[k][1], keep[k][2], hasHaloRunway(k) }
+  end
+  for k in pairs(hardDead) do
+    if not phys[k] and keep[k] and M.inside(b, keep[k][1], keep[k][2], edgeM - 220) then
+      cut[k] = true
+      cutList[#cutList + 1] = { keep[k][1], keep[k][2], false }
     end
   end
   -- A clipped-away arm must not turn a junction into an apparent degree-two seam.
@@ -629,11 +671,14 @@ function M.cutStopped(sp, fwd, roadDot, oneWay, facingCut)
 end
 
 -- Pure: is a car at (px, py) moving along unit (dx, dy) heading for one of the cuts within reach m (45 degrees)?
-function M.headingToCut(px, py, dx, dy, list, reach)
+-- When hardOnly is true, halo-backed inner cuts (c[3] == true) are ignored so only true dead-end cuts match.
+function M.headingToCut(px, py, dx, dy, list, reach, hardOnly)
   for _, c in ipairs(list) do
-    local vx, vy = c[1] - px, c[2] - py
-    local d = math.sqrt(vx * vx + vy * vy)
-    if d <= reach and (d < 1 or (vx * dx + vy * dy) >= 0.7071 * d) then return true end
+    if not (hardOnly and c[3] == true) then
+      local vx, vy = c[1] - px, c[2] - py
+      local d = math.sqrt(vx * vx + vy * vy)
+      if d <= reach and (d < 1 or (vx * dx + vy * dy) >= 0.7071 * d) then return true end
+    end
   end
   return false
 end
@@ -1804,7 +1849,8 @@ local function guard(b, all, lag)
         local rd = nil
         if toCut and (M.FAST_HALO_M or 0) > 0 and sp >= 8.0 then
           rd = roadAt(p.x, p.y, p.z)
-          if M.skipFastHaloCut(rd and (rd.limit or rd.speedLimit) or 0, sp, b, p.x, p.y) then
+          if M.skipFastHaloCut(rd and (rd.limit or rd.speedLimit) or 0, sp, b, p.x, p.y)
+              and not (dl > 1e-6 and M.headingToCut(p.x, p.y, dir.x / dl, dir.y / dl, cuts, reach, true)) then
             toCut = false
           end
         end

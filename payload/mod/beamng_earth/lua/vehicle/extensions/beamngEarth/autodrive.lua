@@ -92,9 +92,11 @@ end
 
 -- GE plans from the vehicle reference point; the stock AI drives from obj:getFrontPosition(). A queued restart
 -- can therefore target a node already behind the AI. Drop only the passed prefix on its outgoing road.
+M.SURFACE_DZ_M = 3.5
 function M.forwardStart(ids, md, p, heading)
   if not md.positions then return ids end
   local first = 1
+  local maxDz = M.SURFACE_DZ_M or 3.5
   while first < #ids do
     local a, b = md.positions[ids[first]], md.positions[ids[first + 1]]
     if not a or not b then break end
@@ -110,7 +112,7 @@ function M.forwardStart(ids, md, p, heading)
     ra, rb = ra or (md.radius and md.radius[ids[first]]) or 8, rb or (md.radius and md.radius[ids[first + 1]]) or 8
     local reach = ra + math.min(1, t) * (rb - ra)
     local ex, ey = p.x - a.x - t * dx, p.y - a.y - t * dy
-    if ex * ex + ey * ey > reach * reach or math.abs(p.z - a.z - t * (b.z - a.z)) > 2 then break end
+    if ex * ex + ey * ey > reach * reach or math.abs(p.z - a.z - t * (b.z - a.z)) > maxDz then break end
     first = first + 1
   end
   if first == 1 then return ids end

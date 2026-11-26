@@ -33,9 +33,9 @@ import zipfile
 import zlib
 
 TAG = "earthAutodriveFixes"
-MARKER = "EARTH_AUTODRIVE_FIXES_0_1_2"
+MARKER = "EARTH_AUTODRIVE_FIXES_0_1_3"
 MARKER_PREFIX = b"EARTH_AUTODRIVE_FIXES_"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 MIN_SUPPORTED_EARTH_VERSION = "v1.9.1-beta.dev.424"
 TIER_FULL_SOLVER = "full_solver"
 TIER_CLIENT_AND_REPORTER = "client_and_reporter"
@@ -384,20 +384,23 @@ def read_experimental_flags(user_dir=None):
     except Exception:
         pass
 
-    settings_file = udir / "settings" / "beamngEarth.json"
-    if settings_file.is_file():
-        try:
-            doc = json.loads(settings_file.read_text(encoding="utf-8-sig"))
-            if isinstance(doc, dict):
-                for key in sorted(doc):
-                    if (key == "roadSigns" or key.startswith("exp")) and doc.get(key) is True:
-                        cleaned = redact_paths(str(key).strip())[:64]
-                        if cleaned and cleaned not in out:
-                            out.append(cleaned)
-                        if len(out) >= 24:
-                            break
-        except Exception:
-            pass
+    for s_rel in ("settings/beamngearth.json", "settings/beamngEarth.json"):
+        settings_file = udir / s_rel
+        if settings_file.is_file():
+            try:
+                doc = json.loads(settings_file.read_text(encoding="utf-8-sig"))
+                if isinstance(doc, dict):
+                    for key in sorted(doc):
+                        if (key == "roadSigns" or key.startswith("exp")) and doc.get(key) is True:
+                            cleaned = redact_paths(str(key).strip())[:64]
+                            if cleaned and cleaned not in out:
+                                out.append(cleaned)
+                            if len(out) >= 24:
+                                break
+                if out:
+                    break
+            except Exception:
+                pass
     return out
 
 
@@ -807,11 +810,20 @@ def _build_taf_earthd_wrapper_src(patch_tier=TIER_FULL_SOLVER):
         "        if isinstance(msg, dict) and msg.get('type') == 'traffic_autodrive_report':",
         f"            import {SERVER_REPORTER_MODULE}",
         "            _srv = getattr(self, 's', None) or getattr(self, 'server', None)",
-        f"            {SERVER_REPORTER_MODULE}.submit(_srv, msg)",
+        "            _up = getattr(self, '_taf_user_path', None)",
+        "            if _up is not None:",
+        "                try:",
+        f"                    {SERVER_REPORTER_MODULE}.submit(_srv, msg, user_path=_up)",
+        "                except TypeError:",
+        f"                    {SERVER_REPORTER_MODULE}.submit(_srv, msg)",
+        "            else:",
+        f"                {SERVER_REPORTER_MODULE}.submit(_srv, msg)",
         "            return None",
         "        res = _taf_orig_dispatch(self, msg)",
         "        if isinstance(msg, dict) and msg.get('type') == 'hello':",
         "            try:",
+        "                if isinstance(msg.get('userPath'), str) and msg.get('userPath').strip():",
+        "                    self._taf_user_path = msg.get('userPath')",
         f"                import {SERVER_REPORTER_MODULE}",
         "                _srv = getattr(self, 's', None) or getattr(self, 'server', None)",
         f"                {SERVER_REPORTER_MODULE}.check_fixed_reports_async(_srv, user_path=msg.get('userPath'))",
@@ -931,13 +943,15 @@ def patch_source_earthd_bytes(raw_bytes):
     hook = (
         '        elif kind == "traffic_autodrive_report":\n'
         f"            import {SERVER_REPORTER_MODULE}\n"
-        f"            {SERVER_REPORTER_MODULE}.submit(self.s, msg)\n"
+        f"            {SERVER_REPORTER_MODULE}.submit(self.s, msg, user_path=getattr(self, '_taf_user_path', None))\n"
     )
     patched = norm.replace(anchor, hook + anchor, 1)
     hello_anchor = '            self.s.check_user_dir(self, msg.get("userPath"))\n'
     if hello_anchor in patched:
         hello_hook = (
             "            try:\n"
+            "                if isinstance(msg.get(\"userPath\"), str) and msg.get(\"userPath\").strip():\n"
+            "                    self._taf_user_path = msg.get(\"userPath\")\n"
             f"                import {SERVER_REPORTER_MODULE}\n"
             f'                {SERVER_REPORTER_MODULE}.check_fixed_reports_async(self.s, user_path=msg.get("userPath"))\n'
             "            except Exception:\n"
@@ -955,19 +969,36 @@ def unpatch_source_earthd_bytes(raw_bytes):
         return raw_bytes
     crlf = "\r\n" in text
     norm = text.replace("\r\n", "\n")
-    hook = (
-        '        elif kind == "traffic_autodrive_report":\n'
-        f"            import {SERVER_REPORTER_MODULE}\n"
-        f"            {SERVER_REPORTER_MODULE}.submit(self.s, msg)\n"
+    hooks = (
+        (
+            '        elif kind == "traffic_autodrive_report":\n'
+            f"            import {SERVER_REPORTER_MODULE}\n"
+            f"            {SERVER_REPORTER_MODULE}.submit(self.s, msg, user_path=getattr(self, '_taf_user_path', None))\n"
+        ),
+        (
+            '        elif kind == "traffic_autodrive_report":\n'
+            f"            import {SERVER_REPORTER_MODULE}\n"
+            f"            {SERVER_REPORTER_MODULE}.submit(self.s, msg)\n"
+        ),
+        (
+            "            try:\n"
+            "                if isinstance(msg.get(\"userPath\"), str) and msg.get(\"userPath\").strip():\n"
+            "                    self._taf_user_path = msg.get(\"userPath\")\n"
+            f"                import {SERVER_REPORTER_MODULE}\n"
+            f'                {SERVER_REPORTER_MODULE}.check_fixed_reports_async(self.s, user_path=msg.get("userPath"))\n'
+            "            except Exception:\n"
+            "                pass\n"
+        ),
+        (
+            "            try:\n"
+            f"                import {SERVER_REPORTER_MODULE}\n"
+            f'                {SERVER_REPORTER_MODULE}.check_fixed_reports_async(self.s, user_path=msg.get("userPath"))\n'
+            "            except Exception:\n"
+            "                pass\n"
+        ),
     )
-    hello_hook = (
-        "            try:\n"
-        f"                import {SERVER_REPORTER_MODULE}\n"
-        f'                {SERVER_REPORTER_MODULE}.check_fixed_reports_async(self.s, user_path=msg.get("userPath"))\n'
-        "            except Exception:\n"
-        "                pass\n"
-    )
-    norm = norm.replace(hook, "").replace(hello_hook, "")
+    for h in hooks:
+        norm = norm.replace(h, "")
     if crlf:
         norm = norm.replace("\n", "\r\n")
     return norm.encode("utf-8")

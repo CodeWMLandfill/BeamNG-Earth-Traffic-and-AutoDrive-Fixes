@@ -64,6 +64,7 @@ M.GRAPH_WAIT_S = 4      -- after this wait, hold and request the vehicle graph a
 M.AUTO_AGGRESSION = 0.3
 M.RACE_AGGRESSION = 0.72
 M.RACE_AWARENESS = 0.55   -- stock planAhead lateral margin in Race; setRacing stays false (3D capsule avoidance)
+M.SURFACE_DZ_M = 3.5      -- vertical curve crest/sag + CG height margin on hilly roads while keeping >=4.8 m decks apart
 -- Safety: the AI brakes to a stop while the world server is away (no new ground or roads: an autodrive left on through
 -- server restarts drove off the loaded world and wrecked the car, 2026-10-14) and goes on when it is back; a car
 -- damaged this much ends the autodrive.
@@ -406,7 +407,7 @@ function M.status()
            remaining = info and info.remaining, eta = info and info.eta, routeVersion = route and route.version or 0,
            progress = progress, planning = pendingId ~= nil, routeError = routeError, pendingId = pendingId,
            autodrive = auto, autodriveMode = autoMode, tune = M.readTune(),
-           autoNodes = autoPath and #autoPath or nil, off = info and info.off, arrows = routedTo,
+           autoNodes = autoPath and #autoPath or nil, blocked = autoBlocked or false, off = info and info.off, arrows = routedTo,
            avoided = route and route.avoided, avoidHighways = avoidHighways(),
            routeDownload = downloadProgress, replans = M.noProgressReplans, recoveries = M.autoRecoveries,
            waypoints = #vias > 0 and M.waypoints() or nil, legs = route and route.legs or nil }
@@ -908,7 +909,7 @@ function M.edgeUnder(nodes, px, py, hx, hy, pz, toleranceOrPath, pathArg)
       if tolerance then
         score = d * d + dz * dz
       else
-        local inSeg = along >= 0 and along <= 1 and math.abs(dz) <= 2
+        local inSeg = along >= 0 and along <= 1 and math.abs(dz) <= (M.SURFACE_DZ_M or 3.5)
         local onSurface = inSeg and d < effHalf
         local onActive = (onSurface and isPreferred(from, to)) and 1 or 0
         if onSurface then
@@ -1005,12 +1006,30 @@ function M.targetNodes(a, b, target)
   local function add(point)
     local s = point and point.segment
     if not s then return false end
+    if #ids == 2 and ((s.a == a and s.b == b) or (s.a == b and s.b == a)) then return true end
     local id = (s[3] - s[1]) * point.dx + (s[4] - s[2]) * point.dy >= 0 and s.b or s.a
+    -- Do not bounce back to the immediately preceding node across the approach or just-traversed edge
+    -- when an obtuse corner chord flips a two-way segment's dot product, while keeping real multi-edge U-turns.
+    if #ids >= 2 and id == ids[#ids - 1] then return true end
     if id ~= ids[#ids] then ids[#ids + 1] = id end
     return true
   end
   for _, via in ipairs(target.via or {}) do if not add(via.projection) then return end end
   if add(target.projection) then return ids end
+end
+
+local function hasUnexpectedBounce(ids, pins)
+  if type(ids) ~= 'table' or #ids < 3 then return false end
+  local pinBounce = {}
+  if type(pins) == 'table' then
+    for i = 2, #pins - 1 do
+      if pins[i - 1] == pins[i + 1] then pinBounce[pins[i]] = true end
+    end
+  end
+  for i = 2, #ids - 1 do
+    if ids[i - 1] == ids[i + 1] and not pinBounce[ids[i]] then return true end
+  end
+  return false
 end
 
 local function driveArrowsPath(gm, nodes, target)
@@ -1046,8 +1065,8 @@ local function driveArrowsPath(gm, nodes, target)
   local valid = M.validFrom(ids, 1, { nodes })
   local joined = M.connectedStart(valid, a, b, nodes)
   local pins = M.targetNodes(a, b, target)
-  -- A connected prefix may still omit a turn and final edge stored only as positions.
-  if #valid < #ids or not joined or (pins and valid[#valid] ~= pins[#pins]) then
+  -- A connected prefix may still omit a turn and final edge stored only as positions, or bounce at a two-way bend.
+  if #valid < #ids or not joined or (pins and valid[#valid] ~= pins[#pins]) or hasUnexpectedBounce(joined, pins) then
     if pins then
       local ok, planner = pcall(require, '/lua/ge/extensions/gameplay/route/route')
       if ok then

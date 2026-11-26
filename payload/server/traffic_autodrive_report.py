@@ -38,8 +38,10 @@ ADDON_OPTION_IDS = (
     "beamng-earth-traffic-and-autod",
     "beamng-earth-traffic-and-autodrive-fixes",
 )
-ADDON_VERSION = "0.1.2"
+ADDON_VERSION = "0.1.3"
+EARTH_SUBDIRS = ("beamngearth", "beamngEarth")
 REPORTS_SUBDIR = "traffic_autodrive_reports"
+SHOT_FILENAMES = ("screenshot.jpg", "screenshot.jpeg", "screenshot.png")
 MAX_SHOT_BYTES = int(1.45 * 1024 * 1024)
 ALLOWED_KINDS = ("autodrive", "traffic", "overtake", "routing", "road", "other")
 BUNDLED_FIXED_REPORTS = {}
@@ -274,6 +276,7 @@ def _read_addon_options():
 
 def read_experimental_flags(user_dir=None):
     """Return sanitized list of active BeamNG.Earth experimental switch IDs via guarded import."""
+    raw_flags = []
     try:
         import experimental
         settings_fn = getattr(experimental, "read_settings", None)
@@ -283,7 +286,20 @@ def read_experimental_flags(user_dir=None):
             settings = {}
         raw_flags = list(chosen_fn(settings)) if callable(chosen_fn) else []
     except Exception:
-        return []
+        raw_flags = []
+    if not raw_flags and user_dir:
+        udir = Path(user_dir)
+        for s_rel in ("settings/beamngearth.json", "settings/beamngEarth.json"):
+            sf = udir / s_rel
+            if sf.is_file():
+                try:
+                    doc = json.loads(sf.read_text(encoding="utf-8-sig"))
+                    if isinstance(doc, dict):
+                        raw_flags = [k for k in sorted(doc) if (k == "roadSigns" or k.startswith("exp")) and doc.get(k) is True]
+                        if raw_flags:
+                            break
+                except Exception:
+                    pass
     out = []
     for item in raw_flags[:24]:
         if isinstance(item, str) and item.strip():
@@ -412,25 +428,116 @@ def _atomic_write_json(path, data):
     os.replace(tmp, path)
 
 
+def _safe_within_base(base, target):
+    try:
+        target.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _match_child_exact_or_ci(parent_dir, wanted_name, prefer_names=()):
+    try:
+        by_name = {p.name: p for p in parent_dir.iterdir()}
+    except OSError:
+        return []
+    matches = []
+    seen = set()
+    for pref in prefer_names:
+        cand = by_name.get(pref)
+        if cand is not None and cand.name not in seen:
+            matches.append(cand)
+            seen.add(cand.name)
+    exact = by_name.get(wanted_name)
+    if exact is not None and exact.name not in seen:
+        matches.append(exact)
+        seen.add(exact.name)
+    low = wanted_name.lower()
+    for name in sorted(by_name):
+        if name.lower() == low and name not in seen:
+            matches.append(by_name[name])
+            seen.add(name)
+    return matches
+
+
+def _walk_existing_rel(base, parts):
+    cur_list = [base]
+    for idx, part in enumerate(parts):
+        prefer = EARTH_SUBDIRS if idx == 0 and part.lower() == "beamngearth" else ()
+        nxt_list = []
+        for cur in cur_list:
+            for child in _match_child_exact_or_ci(cur, part, prefer_names=prefer):
+                if child.is_dir():
+                    nxt_list.append(child)
+        if not nxt_list:
+            return []
+        cur_list = nxt_list
+    return [c for c in cur_list if _safe_within_base(base, c)]
+
+
 def _resolve_report_dir(user_dir, rel):
     if not user_dir or not isinstance(rel, str):
         return None
-    rel_clean = rel.replace("\\", "/").lstrip("/")
-    if ".." in rel_clean.split("/") or not rel_clean.startswith("beamngEarth/"):
+    rel_clean = rel.replace("\\", "/").lstrip("/").rstrip("/")
+    parts = [p for p in rel_clean.split("/") if p]
+    if not parts or ".." in parts or parts[0].lower() != "beamngearth":
         return None
-    base = Path(user_dir).resolve()
-    target = (base / rel_clean).resolve()
-    try:
-        target.relative_to(base)
-    except ValueError:
+    base = Path(user_dir)
+    if not base.exists():
+        base = base.resolve()
+    existing = _walk_existing_rel(base, parts)
+    if existing:
+        for cand in existing:
+            if any((cand / fn).is_file() for fn in (*SHOT_FILENAMES, "report.json")):
+                return cand
+        return existing[0]
+    earth_dirs = _match_child_exact_or_ci(base, parts[0], prefer_names=EARTH_SUBDIRS)
+    root_sub = earth_dirs[0] if earth_dirs else (base / parts[0])
+    target = root_sub.joinpath(*parts[1:])
+    if not _safe_within_base(base, target):
         return None
     return target
 
 
-def upload_report(user_dir, msg, endpoint=DEFAULT_ENDPOINT, timeout_s=20.0, wait_shot_s=3.0):
+def _find_reports_roots(user_dir):
+    if not user_dir:
+        return []
+    base = Path(user_dir)
+    if not base.is_dir():
+        return []
+    found = _walk_existing_rel(base, ["beamngEarth", REPORTS_SUBDIR])
+    if found:
+        return found
+    earth_dirs = _match_child_exact_or_ci(base, "beamngEarth", prefer_names=EARTH_SUBDIRS)
+    if earth_dirs:
+        cand = earth_dirs[0] / REPORTS_SUBDIR
+        if _safe_within_base(base, cand):
+            return [cand]
+    return []
+
+
+def _select_report_context(user_dir, user_path, rel):
+    dirs = []
+    for raw_d in (user_path, user_dir):
+        if raw_d:
+            p = Path(str(raw_d).strip())
+            if p not in dirs:
+                dirs.append(p)
+    best_u, best_r = (Path(user_dir) if user_dir else (dirs[0] if dirs else None)), None
+    for cand_u in dirs:
+        rdir = _resolve_report_dir(cand_u, rel)
+        if rdir is not None:
+            if best_r is None:
+                best_u, best_r = cand_u, rdir
+            if rdir.is_dir():
+                return cand_u, rdir
+    return best_u, best_r
+
+
+def upload_report(user_dir, msg, endpoint=DEFAULT_ENDPOINT, timeout_s=20.0, wait_shot_s=3.0, user_path=None):
     """Build, upload, and record receipt for one captured report."""
     opts = _read_addon_options()
-    report_dir = _resolve_report_dir(user_dir, msg.get("rel"))
+    eff_user_dir, report_dir = _select_report_context(user_dir, user_path, msg.get("rel"))
     if opts.get("enableOneHotkeyReport") is False:
         res = {"ok": False, "error": "Disabled in add-on options"}
         if report_dir is not None:
@@ -439,17 +546,29 @@ def upload_report(user_dir, msg, endpoint=DEFAULT_ENDPOINT, timeout_s=20.0, wait
 
     shot_path = None
     if report_dir is not None:
-        candidate = report_dir / "screenshot.jpg"
         deadline = time.monotonic() + max(0.0, float(wait_shot_s))
         while time.monotonic() < deadline:
-            if candidate.is_file() and candidate.stat().st_size > 128:
-                shot_path = candidate
+            # Re-resolve once in case BeamNG created lowercase beamngearth/ slightly after net.send
+            if not report_dir.is_dir():
+                _, refreshed = _select_report_context(user_dir, user_path, msg.get("rel"))
+                if refreshed is not None:
+                    report_dir = refreshed
+            for fn in SHOT_FILENAMES:
+                candidate = report_dir / fn
+                if candidate.is_file() and candidate.stat().st_size > 128:
+                    shot_path = candidate
+                    break
+            if shot_path is not None:
                 break
             time.sleep(0.15)
-        if shot_path is None and candidate.is_file() and candidate.stat().st_size > 0:
-            shot_path = candidate
+        if shot_path is None:
+            for fn in SHOT_FILENAMES:
+                candidate = report_dir / fn
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    shot_path = candidate
+                    break
 
-    payload = build_payload(msg, shot_path=shot_path, options=opts, user_dir=user_dir)
+    payload = build_payload(msg, shot_path=shot_path, options=opts, user_dir=eff_user_dir)
 
     def _post_json(body_dict):
         req = urllib.request.Request(
@@ -619,45 +738,48 @@ def check_fixed_reports(user_dir, fixed_url=FIXED_REPORTS_URL, timeout_s=4.0, op
     if not user_dir:
         return []
     opts = options if options is not None else _read_addon_options()
-    reports_root = Path(user_dir).resolve() / "beamngEarth" / REPORTS_SUBDIR
-    pending_path = reports_root / "pending_fix_notifications.json"
+    roots = [r for r in _find_reports_roots(user_dir) if r.is_dir()]
+    pending_paths = [r / "pending_fix_notifications.json" for r in roots]
 
     def _clear_pending():
-        try:
-            if pending_path.exists():
-                pending_path.unlink()
-        except OSError:
-            pass
+        for pp in pending_paths:
+            try:
+                if pp.exists():
+                    pp.unlink()
+            except OSError:
+                pass
 
     if opts.get("notifyFixedReports") is False:
         _clear_pending()
         return []
-    if not reports_root.is_dir():
+    if not roots:
         return []
 
     candidates = []
-    try:
-        entries = sorted(reports_root.iterdir(), key=lambda p: p.name)
-    except OSError:
-        return []
-
-    for sub in entries:
-        if not sub.is_dir() or ".." in sub.name or "/" in sub.name or "\\" in sub.name:
-            continue
-        if (sub / "notified_fixed.json").is_file():
-            continue
-        up_path = sub / "uploaded.json"
-        if not up_path.is_file():
-            continue
+    seen_subs = set()
+    for reports_root in roots:
         try:
-            up_doc = json.loads(up_path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
+            entries = sorted(reports_root.iterdir(), key=lambda p: p.name)
+        except OSError:
             continue
-        if not isinstance(up_doc, dict) or up_doc.get("ok") is not True:
-            continue
-        num = _parse_positive_int(up_doc.get("issueNumber"))
-        if num is not None:
-            candidates.append((num, sub))
+        for sub in entries:
+            if not sub.is_dir() or ".." in sub.name or "/" in sub.name or "\\" in sub.name:
+                continue
+            if (sub / "notified_fixed.json").is_file():
+                continue
+            up_path = sub / "uploaded.json"
+            if not up_path.is_file():
+                continue
+            try:
+                up_doc = json.loads(up_path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(up_doc, dict) or up_doc.get("ok") is not True:
+                continue
+            num = _parse_positive_int(up_doc.get("issueNumber"))
+            if num is not None and (num, sub.name) not in seen_subs:
+                seen_subs.add((num, sub.name))
+                candidates.append((num, sub))
 
     if not candidates:
         _clear_pending()
@@ -718,10 +840,11 @@ def check_fixed_reports(user_dir, fixed_url=FIXED_REPORTS_URL, timeout_s=4.0, op
         _clear_pending()
         return []
 
-    try:
-        _atomic_write_json(pending_path, {"version": 1, "items": items})
-    except OSError as err:
-        log.debug("traffic_autodrive_report: failed writing pending_fix_notifications.json (%s)", err)
+    for pp in pending_paths:
+        try:
+            _atomic_write_json(pp, {"version": 1, "items": items})
+        except OSError as err:
+            log.debug("traffic_autodrive_report: failed writing pending_fix_notifications.json (%s)", err)
     return items
 
 
@@ -760,16 +883,19 @@ def check_addon_update(
     if not user_dir:
         return None
     opts = options if options is not None else _read_addon_options()
-    reports_root = Path(user_dir).resolve() / "beamngEarth" / REPORTS_SUBDIR
-    pending_path = reports_root / "pending_update_notification.json"
-    dismissed_path = reports_root / "dismissed_update.json"
+    roots = _find_reports_roots(user_dir)
+    if not roots:
+        roots = [Path(user_dir).resolve() / "beamngEarth" / REPORTS_SUBDIR]
+    pending_paths = [r / "pending_update_notification.json" for r in roots]
+    dismissed_paths = [r / "dismissed_update.json" for r in roots]
 
     def _clear_pending():
-        try:
-            if pending_path.exists():
-                pending_path.unlink()
-        except OSError:
-            pass
+        for pp in pending_paths:
+            try:
+                if pp.exists():
+                    pp.unlink()
+            except OSError:
+                pass
 
     if opts.get("notifyAddonUpdates") is False or os.environ.get("BNE_TELEMETRY", "").strip().lower() == "off":
         _clear_pending()
@@ -820,16 +946,17 @@ def check_addon_update(
         _clear_pending()
         return None
 
-    if dismissed_path.is_file():
-        try:
-            dis_doc = json.loads(dismissed_path.read_text(encoding="utf-8-sig"))
-            if isinstance(dis_doc, dict):
-                skipped_ver = str(dis_doc.get("skippedVersion") or "").strip().lstrip("v")
-                if skipped_ver == rel[2]:
-                    _clear_pending()
-                    return None
-        except (OSError, ValueError):
-            pass
+    for dismissed_path in dismissed_paths:
+        if dismissed_path.is_file():
+            try:
+                dis_doc = json.loads(dismissed_path.read_text(encoding="utf-8-sig"))
+                if isinstance(dis_doc, dict):
+                    skipped_ver = str(dis_doc.get("skippedVersion") or "").strip().lstrip("v")
+                    if skipped_ver == rel[2]:
+                        _clear_pending()
+                        return None
+            except (OSError, ValueError):
+                pass
 
     item = {
         "version": 1,
@@ -838,10 +965,14 @@ def check_addon_update(
         "tagName": tag_name,
         "releaseUrl": safe_url,
     }
-    try:
-        _atomic_write_json(pending_path, item)
-    except OSError as err:
-        log.debug("traffic_autodrive_report: failed writing pending_update_notification.json (%s)", err)
+    wrote_any = False
+    for pp in pending_paths:
+        try:
+            _atomic_write_json(pp, item)
+            wrote_any = True
+        except OSError as err:
+            log.debug("traffic_autodrive_report: failed writing pending_update_notification.json (%s)", err)
+    if not wrote_any:
         return None
     return item
 
@@ -884,13 +1015,13 @@ def check_fixed_reports_async(
     return t
 
 
-def submit(server, msg, endpoint=DEFAULT_ENDPOINT):
+def submit(server, msg, endpoint=DEFAULT_ENDPOINT, user_path=None):
     """Fire-and-forget daemon upload so earthd's event loop never blocks."""
     user_dir = getattr(server, "user_dir", None)
     t = threading.Thread(
         target=upload_report,
         args=(user_dir, msg),
-        kwargs={"endpoint": endpoint},
+        kwargs={"endpoint": endpoint, "user_path": user_path},
         name="traffic-autodrive-report",
         daemon=True,
     )

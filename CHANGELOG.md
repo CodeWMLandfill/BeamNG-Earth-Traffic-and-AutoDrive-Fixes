@@ -2,6 +2,13 @@
 
 All notable changes to **BeamNG.Earth - Traffic and AutoDrive fixes** are documented in this file.
 
+## [0.1.3] - 2026-11-26
+
+### Fixed
+- **Two-Way Road AutoDrive Corner Continuity & Hilly Grade Snapping:** Prevents reverse-node bounce loops (`a -> b -> a`) at turns on two-way roads so AutoDrive drives smoothly through bends and T-junctions without sudden U-turns or stalls, and widens surface vertical-curve grade tolerance (`3.5 m`) while keeping overpasses and stacked decks separated.
+- **Arterial Dead-End U-Turn Prevention:** Distinguishes extended fast-halo corridors from true dead-end graph cuts where an arterial transitions into a slower zone near the block boundary, recycling AI traffic before cars brake and make three-point U-turns across two-lane roads.
+- **Linux Case-Sensitive VFS Screenshot & Notification Path Resolution (`dev.607` / `dev.617`+):** Resolves lowercase `beamngearth/` folders created by **BeamNG.drive**'s virtual filesystem on case-sensitive Linux drives so `Ctrl+Shift+T` screenshots, receipts, and launch fix/update notices attach reliably alongside full `dev.607` / `dev.617` settings compatibility.
+
 ## [0.1.2] - 2026-11-25
 
 ### Fixed

@@ -5,7 +5,7 @@ local M = {}
 
 M.LEVEL_ID = 'beamng_earth'
 M.ADDON_ID = 'beamng-earth-autodrive-fixes'
-M.ADDON_VERSION = '0.1.2'
+M.ADDON_VERSION = '0.1.3'
 M.DIR = 'beamngEarth/traffic_autodrive_reports/'
 M.POLL_TIMEOUT_S = 22
 M.FIX_NOTIFY_SETTLE_S = 3.0
@@ -258,8 +258,12 @@ local function collectDrivingTelemetry(veh)
       end
       if type(gps.status) == 'function' then
         local st = gps.status()
-        if type(st) == 'table' and type(st.remaining) == 'number' then
-          ad.remainingM = round2(st.remaining)
+        if type(st) == 'table' then
+          if type(st.remaining) == 'number' then ad.remainingM = round2(st.remaining) end
+          if type(st.autoNodes) == 'number' then ad.autoNodes = math.floor(st.autoNodes) end
+          if type(st.replans) == 'number' then ad.replans = math.floor(st.replans) end
+          if type(st.recoveries) == 'number' then ad.recoveries = math.floor(st.recoveries) end
+          if st.blocked ~= nil then ad.blocked = st.blocked and true or false end
         end
       end
     end
@@ -302,7 +306,9 @@ local function collectDrivingTelemetry(veh)
     if nodes and px and py and gps and type(gps.edgeUnder) == 'function' then
       local a, b = gps.edgeUnder(nodes, px, py, fx, fy, pz)
       local na, nb = a and nodes[a], b and nodes[b]
-      local e = na and na.links and na.links[b]
+      local e = (type(gps.edge) == 'function' and gps.edge(nodes, a, b))
+        or (na and na.links and na.links[b])
+        or (nb and nb.links and nb.links[a])
       if na and nb and e then
         local dx, dy = nb.pos.x - na.pos.x, nb.pos.y - na.pos.y
         local lenSq = dx * dx + dy * dy
@@ -701,8 +707,21 @@ function M.captureSilent()
   toast, toastUntil = nil, 0
   fixToast = nil
   updateToast = nil
+  local shotRel = rel .. 'screenshot'
+  local tookShot = false
   if type(createScreenshot2) == 'function' then
-    pcall(createScreenshot2, { filename = rel .. 'screenshot', writeJPG = true, superSampling = 1 })
+    local okS, resS = pcall(createScreenshot2, {
+      filename = shotRel,
+      writeJPG = true,
+      superSampling = 1,
+      tiles = 1,
+      overlap = 0,
+      rescaleFactor = 1,
+    })
+    tookShot = okS and resS ~= false and resS ~= 0
+  end
+  if not tookShot and type(createScreenshot) == 'function' then
+    pcall(createScreenshot, shotRel, 'jpg', 1, 1, 0, false)
   end
 
   local noteText = 'Captured with Ctrl+Shift+T silent 1-hotkey reporter (Traffic and AutoDrive fixes).'

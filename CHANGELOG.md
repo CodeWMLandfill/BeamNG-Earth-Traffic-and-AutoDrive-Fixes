@@ -2,6 +2,13 @@
 
 All notable changes to **BeamNG.Earth - Traffic and AutoDrive fixes** are documented in this file.
 
+## [0.1.4] - 2026-11-27
+
+### Fixed
+- **Undivided Two-Lane Highway Horizon & Oncoming Spawns:** Walks curving two-lane highways by local road tangent continuity, requires verified forward highway runway (`>= 200 m` ahead, `>= 220 m` oncoming) clear of dead-end graph cuts, and places oncoming traffic cleanly on undivided two-lane highways without falling back to short behind-camera teleports that triggered mid-highway U-turns.
+- **Pooled Respawn AI & Post-Crash Role Reset Before Cloaking:** Runs `veh:onRefresh()` and clears stale `follow`/`chase` post-crash role states and `respawnSpeed` before `cloakPreRoll()` sets `state = 'preRoll'`, preventing recycled traffic vehicles from retaining stale routes, reversing on spawn, or chasing the player across respawns.
+- **DCT Dual-Clutch & Automatic ShiftLogic Drive Sync + Cloaked Reverse Guard:** Synchronizes `dctGearbox` odd/even shaft gear indices and clutch ratios plus `automaticGearbox` `grb_mde = 'D'` / `'N'` state in `spawnMotion.lua` (preserving arcade behavior), and immediately recycles cloaked vehicles that reverse or turn across fast roads instead of uncloaking them on timer expiry.
+
 ## [0.1.3] - 2026-11-26
 
 ### Fixed

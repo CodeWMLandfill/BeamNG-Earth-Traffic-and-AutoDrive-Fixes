@@ -38,7 +38,7 @@ ADDON_OPTION_IDS = (
     "beamng-earth-traffic-and-autod",
     "beamng-earth-traffic-and-autodrive-fixes",
 )
-ADDON_VERSION = "0.1.3"
+ADDON_VERSION = "0.1.4"
 EARTH_SUBDIRS = ("beamngearth", "beamngEarth")
 REPORTS_SUBDIR = "traffic_autodrive_reports"
 SHOT_FILENAMES = ("screenshot.jpg", "screenshot.jpeg", "screenshot.png")

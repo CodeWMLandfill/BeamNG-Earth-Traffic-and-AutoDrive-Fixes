@@ -33,9 +33,9 @@ import zipfile
 import zlib
 
 TAG = "earthAutodriveFixes"
-MARKER = "EARTH_AUTODRIVE_FIXES_0_1_3"
+MARKER = "EARTH_AUTODRIVE_FIXES_0_1_4"
 MARKER_PREFIX = b"EARTH_AUTODRIVE_FIXES_"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 MIN_SUPPORTED_EARTH_VERSION = "v1.9.1-beta.dev.424"
 TIER_FULL_SOLVER = "full_solver"
 TIER_CLIENT_AND_REPORTER = "client_and_reporter"

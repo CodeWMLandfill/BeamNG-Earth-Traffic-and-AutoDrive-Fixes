@@ -104,6 +104,8 @@ M.JUMP_M = 30           -- a car this much farther than at the last check was re
 M.AHEAD_MS = 20         -- (45 mph)
 M.AHEAD_M = { 420, 760 }
 M.UNCLOAK_MIN_M = 360
+M.HORIZON_RUNWAY_MIN_M = 200 -- connected forward highway runway required past a horizon spawn pose
+M.ONCOMING_RUNWAY_MIN_M = 220 -- connected oncoming highway runway required on undivided 2-lane highways
 M.AHEAD_FULL = 4        -- this many same-way cars already ahead: do not add another in front
 M.CLEAR_GAP_M = 150     -- open gap between an existing car and a newly placed platoon
 M.PLATOON_GAP_M = 34    -- spacing of a second car placed behind the lead of a platoon
@@ -1157,12 +1159,75 @@ local function travelRankOf(n)
   return 1
 end
 
+-- Pure: true when at least `minRunwayM` of connected highway edges continue from `(cx, cy)` on
+-- `startEdge` along `alongOut` without pointing into a hard dead-end cut within 180 m.
+function M.hasHighwayRunway(nodes, startEdge, cx, cy, alongOut, minRunwayM, cutsList)
+  minRunwayM = tonumber(minRunwayM) or M.HORIZON_RUNWAY_MIN_M
+  if minRunwayM <= 0 then return true end
+  if type(nodes) ~= 'table' or type(startEdge) ~= 'table' then return false end
+  if startEdge.oneWay and not alongOut then return false end
+  if type(startEdge.lanes) == 'string' and sameWayCount(startEdge.lanes, alongOut) < 1 then return false end
+  local ix, iy, _iz, ox, oy, _oz, ex, ey = edgeGeom(startEdge)
+  if not ix then return false end
+  local destx, desty, curHx, curHy, destName
+  if alongOut then
+    destx, desty, curHx, curHy, destName = ox, oy, ex, ey, startEdge.outNode
+  else
+    destx, desty, curHx, curHy, destName = ix, iy, -ex, -ey, startEdge.inNode
+  end
+  local cutCheckM = math.min(180, minRunwayM)
+  if type(cutsList) == 'table' and M.headingToCut(cx, cy, curHx, curHy, cutsList, cutCheckM, true) then
+    return false
+  end
+  local acc = math.sqrt((destx - cx) ^ 2 + (desty - cy) ^ 2)
+  if acc >= minRunwayM then return true end
+  local visited = { [startEdge] = true }
+  local curX, curY = destx, desty
+  local steps = 0
+  while destName and acc < minRunwayM and steps < 24 do
+    steps = steps + 1
+    local nd = nodes[destName]
+    if not (nd and type(nd.links) == 'table') then break end
+    local bestE, bestDot, bestToward, bestLen, bestNx, bestNy, bestHx, bestHy, bestDest = nil, 0.5, true, 0, 0, 0, 0, 0, nil
+    for _, e2 in pairs(nd.links) do
+      if not visited[e2] and highwayEdge(e2) then
+        local nix, niy, _niz, nox, noy, _noz, nex, ney, nel = edgeGeom(e2)
+        if nix then
+          local toward2 = e2.inNode == destName
+          if not (e2.oneWay and not toward2)
+              and (type(e2.lanes) ~= 'string' or sameWayCount(e2.lanes, toward2) >= 1) then
+            local hx2, hy2 = nex, ney
+            if not toward2 then hx2, hy2 = -nex, -ney end
+            local cdot = hx2 * curHx + hy2 * curHy
+            if cdot > bestDot and not (type(cutsList) == 'table'
+                and M.headingToCut(curX, curY, hx2, hy2, cutsList, cutCheckM, true)) then
+              bestE, bestDot, bestToward, bestLen = e2, cdot, toward2, nel
+              bestHx, bestHy = hx2, hy2
+              if toward2 then
+                bestNx, bestNy, bestDest = nox, noy, e2.outNode
+              else
+                bestNx, bestNy, bestDest = nix, niy, e2.inNode
+              end
+            end
+          end
+        end
+      end
+    end
+    if not bestE then break end
+    visited[bestE] = true
+    acc = acc + bestLen
+    curX, curY, curHx, curHy, destName = bestNx, bestNy, bestHx, bestHy, bestDest
+  end
+  return acc >= minRunwayM
+end
+
 -- Pure: a lane-centred pose on the highway ahead of the player, or nil when the corridor
 -- is full, the block is too short, or every spot is blocked. Does not teleport; the guard
 -- places the pose and cloaks the car. platoonSlot 0 is the lead. A later slot sits
 -- PLATOON_GAP_M behind that lead, or in the next lane inward when a slower travel-lane
--- car is 18-32 m ahead of the spot.
-function M.pickHorizonPose(nodes, px, py, pz, vx, vy, b, collideReachM, rightHandDrive, existingCars, platoonSlot)
+-- car is 18-32 m ahead of the spot. When `oncoming` is true, selects an oncoming pose on an
+-- undivided 2-lane highway (`oneWay == false`) >= 380 m ahead with >= 220 m reverse runway.
+function M.pickHorizonPose(nodes, px, py, pz, vx, vy, b, collideReachM, rightHandDrive, existingCars, platoonSlot, cutsList, oncoming)
   if type(nodes) ~= 'table' then return nil end
   px, py = tonumber(px), tonumber(py)
   pz = tonumber(pz) or 0
@@ -1175,12 +1240,33 @@ function M.pickHorizonPose(nodes, px, py, pz, vx, vy, b, collideReachM, rightHan
   collideReachM = tonumber(collideReachM)
   local target = M.horizonDistance(playerMps, nil, boxReach, collideReachM)
   if not target then return nil end
+  local isOncoming = oncoming == true
+  local minRawDist = isOncoming and 380 or 260
+  local minWalkDist = isOncoming and 380 or 280
   local searchMax = math.min(boxReach, collideReachM or math.huge)
-  if searchMax < 280 then return nil end
-  local count = M.aheadCorridorState(existingCars, px, py, ux, uy, math.max(600, M.AHEAD_M[2] + 90), 40)
-  if count >= M.AHEAD_FULL then return nil end
+  if searchMax < minWalkDist then return nil end
   local cars = existingCars or {}
-  local slot = tonumber(platoonSlot) or 0
+  if not isOncoming then
+    local count = M.aheadCorridorState(cars, px, py, ux, uy, math.max(600, M.AHEAD_M[2] + 90), 40)
+    if count >= M.AHEAD_FULL then return nil end
+  else
+    local oncCount = 0
+    local maxCorr = math.max(600, M.AHEAD_M[2] + 90)
+    for _, c in ipairs(cars) do
+      if type(c) == 'table' and tonumber(c.x) and tonumber(c.y) then
+        local dxC, dyC = c.x - px, c.y - py
+        local aheadC = dxC * ux + dyC * uy
+        local sideC = math.abs(-dxC * uy + dyC * ux)
+        local vxC, vyC = tonumber(c.vx), tonumber(c.vy)
+        if aheadC > 0 and aheadC <= maxCorr and sideC <= 40 and vxC and vyC then
+          local spC = math.sqrt(vxC * vxC + vyC * vyC)
+          if spC > 1.5 and (vxC * ux + vyC * uy) / spC < -0.5 then oncCount = oncCount + 1 end
+        end
+      end
+    end
+    if oncCount >= M.AHEAD_FULL then return nil end
+  end
+  local slot = isOncoming and 0 or (tonumber(platoonSlot) or 0)
   if slot < 0 then slot = 0 end
 
   local bad = {}
@@ -1250,10 +1336,16 @@ function M.pickHorizonPose(nodes, px, py, pz, vx, vy, b, collideReachM, rightHan
     return za + (zb - za) * t
   end
   local function pushRaw(cx, cy, cz, dist, iox, ioy, alongOut, e, onRamp, extra)
-    if dist < 260 or dist > searchMax then return nil end
+    if dist < minRawDist or dist > searchMax then return nil end
+    if (cx - px) * ux + (cy - py) * uy < 180 then return nil end
+    if isOncoming and (e.oneWay ~= false or onRamp) then return nil end
     if type(e.lanes) ~= 'string' then return nil end
-    local nLanes = sameWayCount(e.lanes, alongOut)
+    local carAlong = alongOut and true or false
+    if isOncoming then carAlong = not carAlong end
+    local nLanes = sameWayCount(e.lanes, carAlong)
     if nLanes < 1 then return nil end
+    local needRunway = isOncoming and M.ONCOMING_RUNWAY_MIN_M or M.HORIZON_RUNWAY_MIN_M
+    if not M.hasHighwayRunway(nodes, e, cx, cy, carAlong, needRunway, cutsList) then return nil end
     local ix, iy, iz, ox, oy, oz, ex, ey, el = edgeGeom(e)
     if not ix then return nil end
     local t = math.max(0, math.min(1, ((cx - ix) * ex + (cy - iy) * ey) / el))
@@ -1269,10 +1361,10 @@ function M.pickHorizonPose(nodes, px, py, pz, vx, vy, b, collideReachM, rightHan
     end
     samples[#samples + 1] = extra or { x = cx, y = cy, z = cz, dist = dist }
     local hx, hy = iox, ioy
-    if not alongOut then hx, hy = -iox, -ioy end
+    if not carAlong then hx, hy = -iox, -ioy end
     raw[#raw + 1] = {
       cx = cx, cy = cy, cz = cz, dist = dist, iox = iox, ioy = ioy, hx = hx, hy = hy,
-      alongOut = alongOut, lanes = e.lanes, radius = radius, nLanes = nLanes,
+      alongOut = carAlong, lanes = e.lanes, radius = radius, nLanes = nLanes,
       travelRank = travelRankOf(nLanes), onRamp = onRamp and true or false,
       occluded = M.isOccludedSpot(samples, px, py, pz, ux, uy),
       terrainZ = terrainAt(e, t, cx, cy, cz, dist),
@@ -1309,14 +1401,14 @@ function M.pickHorizonPose(nodes, px, py, pz, vx, vy, b, collideReachM, rightHan
       line[#line + 1] = {
         x = x, y = y, z = z, dist = dist, iox = ex, ioy = ey, alongOut = towardOut, e = edge,
       }
-      if dist >= 280 and dist <= searchMax then
+      if dist >= minWalkDist and dist <= searchMax then
         pushRaw(x, y, z, dist, ex, ey, towardOut, edge, false)
       end
     end
     travelled = base + remain
     local destName = towardOut and edge.outNode or edge.inNode
     local nd = destName and nodes[destName]
-    if nd and type(nd.links) == 'table' and travelled >= 260 and travelled <= searchMax + 40 then
+    if not isOncoming and nd and type(nd.links) == 'table' and travelled >= 260 and travelled <= searchMax + 40 then
       for _, e2 in pairs(nd.links) do
         if e2 ~= edge and highwayEdge(e2) and e2.outNode == destName then
           local rix, riy, riz, rox, roy, roz, rex, rey, rel = edgeGeom(e2)
@@ -1330,17 +1422,27 @@ function M.pickHorizonPose(nodes, px, py, pz, vx, vy, b, collideReachM, rightHan
         end
       end
     end
-    local nextE, nextDot, nextToward = nil, 0.55, true
+    local curR2 = (destx - px) ^ 2 + (desty - py) ^ 2
+    local nextE, nextDot, nextToward = nil, 0.5, true
     if nd and type(nd.links) == 'table' then
       for _, e2 in pairs(nd.links) do
         if e2 ~= edge and not visited[e2] and highwayEdge(e2) then
-          local nix, niy, niz, nox, noy, noz, nex, ney = edgeGeom(e2)
+          local nix, niy, _niz, nox, noy, _noz, nex, ney = edgeGeom(e2)
           if nix then
             local toward = e2.inNode == destName
-            local hx, hy = nex, ney
-            if not toward then hx, hy = -nex, -ney end
-            local dot = hx * ux + hy * uy
-            if dot > nextDot then nextE, nextDot, nextToward = e2, dot, toward end
+            if not (e2.oneWay and not toward) then
+              local hx, hy = nex, ney
+              if not toward then hx, hy = -nex, -ney end
+              local nDestX = toward and nox or nix
+              local nDestY = toward and noy or niy
+              local nxtR2 = (nDestX - px) ^ 2 + (nDestY - py) ^ 2
+              local fwdProj = (nDestX - px) * ux + (nDestY - py) * uy
+              local minFwd = (travelled >= 200) and 180 or 1
+              local contDot = hx * dirx + hy * diry
+              if nxtR2 > curR2 and fwdProj >= minFwd and contDot > nextDot then
+                nextE, nextDot, nextToward = e2, contDot, toward
+              end
+            end
           end
         end
       end
@@ -1507,6 +1609,12 @@ local function carsAround(skipId)
   return cars
 end
 
+local function objectById(id)
+  if type(getObjectByID) ~= 'function' then return nil end
+  local ok, o = pcall(getObjectByID, id)
+  if ok then return o end
+end
+
 local function cloakPreRoll(t, o)
   if type(t) == 'table' then
     t.alpha = 0
@@ -1515,11 +1623,42 @@ local function cloakPreRoll(t, o)
   if o and o.setMeshAlpha then pcall(o.setMeshAlpha, o, 0, '') end
 end
 
+-- Stock gameplay/traffic.lua calls veh:onRefresh() inside doTraffic() ONLY when veh.state == 'reset'.
+-- Cloaking a respawn immediately sets t.state = 'preRoll', which otherwise skips onRefresh() forever
+-- (leaving stale AI routes that reverse/3-point-turn and permanent post-crash follow/chase roles).
+local function refreshBeforeCloak(id, t, o, force)
+  o = o or (id and objectById(id)) or nil
+  if type(t) == 'table' then
+    local roleDirty = type(t.role) == 'table' and t.role.state ~= nil and t.role.state ~= 'none'
+    if roleDirty and type(t.role) == 'table' then
+      t.role.keepActionOnRefresh = false
+    end
+    local wasReset = t.state == 'reset'
+    local rcNow = tonumber(t.respawnCount)
+    local alreadyRefreshed = rcNow ~= nil and t._bneRefreshedRc == rcNow and not wasReset and not roleDirty
+    if (force or wasReset) and not alreadyRefreshed then
+      if type(t.onRefresh) == 'function' then pcall(t.onRefresh, t) end
+      t._bneRefreshedRc = tonumber(t.respawnCount) or rcNow
+    end
+    if type(t.role) == 'table' and t.role.state ~= nil and t.role.state ~= 'none' then
+      roleDirty = true
+      if type(t.role.resetAction) == 'function' then pcall(t.role.resetAction, t.role) end
+      t.role.state = 'none'
+    end
+    t.respawnSpeed = nil
+    if t.isAi ~= false and o and type(o.queueLuaCommand) == 'function' and ((force and not alreadyRefreshed) or wasReset or roleDirty) then
+      pcall(o.queueLuaCommand, o, 'if ai then ai.setMode("traffic"); ai.driveInLane("on"); ai.reset() end')
+    end
+  end
+  cloakPreRoll(t, o)
+end
+M.refreshBeforeCloak = refreshBeforeCloak
+
 local nextPlatoonSlot, lastPlatoonAt = 0, -math.huge
 
--- Place one ahead recycle on the horizon pose and cloak it. Returns false when the
--- planner declines, so the caller sends the car behind the camera instead.
-local function placeAhead(id, o, traffic, pp, pu, b, now)
+-- Place one ahead (or oncoming 2-lane) recycle on the horizon pose and cloak it. Returns false
+-- when the planner declines, so the caller sends the car behind the camera instead.
+local function placeAhead(id, o, traffic, pp, pu, b, now, oncoming)
   if not (o and spawn and type(spawn.safeTeleport) == 'function' and type(quatFromDir) == 'function'
       and type(vec3) == 'function' and pp and pu) then
     return false
@@ -1528,29 +1667,30 @@ local function placeAhead(id, o, traffic, pp, pu, b, now)
   if not (m and m.nodes) then return false end
   local sp = math.sqrt(pu.x * pu.x + pu.y * pu.y)
   if sp < M.AHEAD_MS then return false end
-  local slot = (now - lastPlatoonAt <= 5.0 and nextPlatoonSlot > 0 and nextPlatoonSlot <= 2) and nextPlatoonSlot or 0
+  local isOnc = oncoming == true
+  local slot = (not isOnc and now - lastPlatoonAt <= 5.0 and nextPlatoonSlot > 0 and nextPlatoonSlot <= 2)
+    and nextPlatoonSlot or 0
   local around = carsAround(id)
   local reach = collideReachOf(sp)
   local rhd = M.rules.rightHandDrive == true
-  local pose = M.pickHorizonPose(m.nodes, pp.x, pp.y, pp.z or 0, pu.x, pu.y, b, reach, rhd, around, slot)
+  local pose = M.pickHorizonPose(m.nodes, pp.x, pp.y, pp.z or 0, pu.x, pu.y, b, reach, rhd, around, slot, cuts, isOnc)
   if not pose and slot > 0 then
     slot = 0
-    pose = M.pickHorizonPose(m.nodes, pp.x, pp.y, pp.z or 0, pu.x, pu.y, b, reach, rhd, around, 0)
+    pose = M.pickHorizonPose(m.nodes, pp.x, pp.y, pp.z or 0, pu.x, pu.y, b, reach, rhd, around, 0, cuts, isOnc)
   end
   if not pose then return false end
   local ok = pcall(spawn.safeTeleport, o, vec3(pose.x, pose.y, pose.z),
     quatFromDir(vec3(pose.dx, pose.dy, 0), vec3(0, 0, 1)), true, nil, false, false, true)
   if not ok then return false end
-  nextPlatoonSlot = (slot + 1) % 3
-  lastPlatoonAt = now
+  if not isOnc then
+    nextPlatoonSlot = (slot + 1) % 3
+    lastPlatoonAt = now
+  end
   if type(traffic) == 'table' then
-    if type(traffic.onRefresh) == 'function' then pcall(traffic.onRefresh, traffic) end
     traffic.respawnCount = (tonumber(traffic.respawnCount) or 0) + 1
-    traffic.alpha = 0
-    traffic.state = 'preRoll'
     launchCount[id] = traffic.respawnCount
   end
-  if o.setMeshAlpha then pcall(o.setMeshAlpha, o, 0, '') end
+  refreshBeforeCloak(id, traffic, o, true)
   launchWait[id] = {
     phase = 'prep', nextAt = now + 0.06, expires = now + 0.2 + M.CLOAK_MAX_S,
     minAheadM = M.UNCLOAK_MIN_M, exactPose = true, target = nil,
@@ -1888,7 +2028,24 @@ local function guard(b, all, lag)
         end
         local underCooldown = (now - (lastTeleport[id] or -math.huge)) < M.COOLDOWN_S
         local urgent = not M.inside(b, p.x, p.y, M.GUARD_M)
-        if all or urgent or isHaz or (not underCooldown and (toCut or atCut or M.stuck(stillSince[id], now, d))) then
+        local badCloak = false
+        local cloaked = launchWait[id] ~= nil or (type(traffic) == 'table'
+          and ((tonumber(traffic.alpha) or 1) < 0.25 or traffic.state == 'preRoll'))
+        if not paused and cloaked then
+          if not rd then rd = roadAt(p.x, p.y, p.z) end
+          local lim = rd and tonumber(rd.limit or rd.speedLimit) or 0
+          if lim >= M.HIGHWAY_CLEAR_MS and not nearJunction(p.x, p.y, M.HIGHWAY_JUNC_M) then
+            local f = o:getDirectionVector()
+            local fl = f and math.sqrt(f.x * f.x + f.y * f.y) or 0
+            local fwd = fl > 1e-6 and ((u.x * f.x + u.y * f.y) / fl) or 0
+            local roadDot = (rd and rd.dx and rd.dy and fl > 1e-6)
+              and (rd.dx * (f.x / fl) + rd.dy * (f.y / fl)) or nil
+            if fwd < -1.0 or (sp < 6.0 and roadDot ~= nil and math.abs(roadDot) < 0.5) then
+              badCloak = true
+            end
+          end
+        end
+        if all or urgent or isHaz or badCloak or (not underCooldown and (toCut or atCut or M.stuck(stillSince[id], now, d))) then
           if toCut then stats.cutRespawns = (stats.cutRespawns or 0) + 1
           elseif atCut then stats.cutStopRespawns = (stats.cutStopRespawns or 0) + 1 end
           if isHaz then stats.wreckRespawns = (stats.wreckRespawns or 0) + 1 end
@@ -1899,42 +2056,49 @@ local function guard(b, all, lag)
           local cp, cf = core_camera and core_camera.getPosition(), core_camera and core_camera.getForward()
           local pu = pv and pv:getVelocity()
           local psp = pu and math.sqrt(pu.x * pu.x + pu.y * pu.y) or 0
-          local tryAhead = pp and pu and psp >= M.AHEAD_MS and not all and not isHaz
+          local tryAhead = pp and pu and psp >= M.AHEAD_MS and not all and not isHaz and not badCloak
           local adx, ady = 1, 0
           if tryAhead then adx, ady = pu.x / psp, pu.y / psp end
           local ox, oy, odx, ody
+          local aheadPlaced, oncomingPlaced = false, false
           if tryAhead and M.ONCOMING then
             oncomingTurn = not oncomingTurn
             if oncomingTurn then
               local ok, x, y, ddx, ddy = pcall(M.oncomingSpot, pp.x, pp.y, adx, ady, b, M.rules.rightHandDrive,
                 function(x, y) return closestRoad(x, y, pp.z) end, collideReachOf(psp))
-              if ok and x then ox, oy, odx, ody = x, y, ddx, ddy end
+              if ok and x then
+                ox, oy, odx, ody = x, y, ddx, ddy
+              else
+                local okO, placedO = pcall(placeAhead, id, o, traffic, pp, pu, b, now, true)
+                oncomingPlaced = okO and placedO or false
+              end
             end
           end
-          local aheadPlaced = false
-          if tryAhead and not ox then
-            local okP, placed = pcall(placeAhead, id, o, traffic, pp, pu, b, now)
+          if tryAhead and not ox and not oncomingPlaced then
+            local okP, placed = pcall(placeAhead, id, o, traffic, pp, pu, b, now, false)
             aheadPlaced = okP and placed or false
           end
           if ox then
             stats.oncomingRespawns = (stats.oncomingRespawns or 0) + 1
             cloakPreRoll(traffic, o)
             pcall(gt.forceTeleport, id, vec3(ox, oy, pp.z), vec3(odx, ody, 0), 0, 40)
-            cloakPreRoll(traffic, o)
+            refreshBeforeCloak(id, traffic, o, true)
             launchWait[id] = {
               phase = 'prep', nextAt = now + 0.06, expires = now + 0.2 + M.CLOAK_MAX_S,
               minAheadM = M.UNCLOAK_MIN_M, target = nil,
             }
+          elseif oncomingPlaced then
+            stats.oncomingRespawns = (stats.oncomingRespawns or 0) + 1
           elseif aheadPlaced then
             stats.aheadRespawns = (stats.aheadRespawns or 0) + 1
           elseif cp and cf then
             cloakPreRoll(traffic, o)
             pcall(gt.forceTeleport, id, cp, -cf, M.RESPAWN_M[1], M.RESPAWN_M[2])
-            cloakPreRoll(traffic, o)
+            refreshBeforeCloak(id, traffic, o, true)
           else
             cloakPreRoll(traffic, o)
             pcall(gt.forceTeleport, id)
-            cloakPreRoll(traffic, o)
+            refreshBeforeCloak(id, traffic, o, true)
           end
         end
       else
@@ -2512,12 +2676,6 @@ local function queueMotion(o, body)
     .. body .. ' end')
 end
 
-local function objectById(id)
-  if type(getObjectByID) ~= 'function' then return nil end
-  local ok, o = pcall(getObjectByID, id)
-  if ok then return o end
-end
-
 local function aheadMeters(o)
   if not (o and o.getPosition) then return nil end
   local me = playerId()
@@ -2546,7 +2704,8 @@ end
 local function recycleBehind(id, t, now)
   launchWait[id] = nil
   lastTeleport[id] = now
-  cloakPreRoll(t, objectById(id))
+  local o = objectById(id)
+  cloakPreRoll(t, o)
   local gt = gameplay_traffic
   local cp = core_camera and core_camera.getPosition and core_camera.getPosition()
   local cf = core_camera and core_camera.getForward and core_camera.getForward()
@@ -2555,6 +2714,31 @@ local function recycleBehind(id, t, now)
   elseif gt and gt.forceTeleport then
     pcall(gt.forceTeleport, id)
   end
+  refreshBeforeCloak(id, t, o, true)
+end
+
+local function badFastUncloak(id, o, w)
+  if w and w.lastBodyMps and w.lastBodyMps < -0.25 then return true end
+  o = o or objectById(id)
+  if not (o and o.getPosition and o.getDirectionVector and o.getVelocity) then return false end
+  local p = o:getPosition()
+  local f = o:getDirectionVector()
+  local u = o:getVelocity()
+  if not (p and f and u and p.x and f.x and u.x) then return false end
+  local fl = math.sqrt(f.x * f.x + f.y * f.y + (f.z or 0) * (f.z or 0))
+  local fl2 = math.sqrt(f.x * f.x + f.y * f.y)
+  if fl < 1e-6 or fl2 < 1e-6 then return false end
+  local bodyMps = (u.x * f.x + u.y * f.y + (u.z or 0) * (f.z or 0)) / fl
+  if bodyMps < -0.25 then return true end
+  local rd = roadAt(p.x, p.y, p.z)
+  local lim = rd and tonumber(rd.limit or rd.speedLimit) or 0
+  if lim >= M.HIGHWAY_CLEAR_MS and rd and rd.dx and rd.dy then
+    local fx, fy = f.x / fl2, f.y / fl2
+    local dot = rd.dx * fx + rd.dy * fy
+    local roadAlign = rd.oneWay and dot or math.abs(dot)
+    if roadAlign < 0.7 then return true end
+  end
+  return false
 end
 
 local function uncloakFade(id, t)
@@ -2636,6 +2820,7 @@ end
 function M.onLaunchReport(id, bodyMps, wheelMps, parkingBrake, brake)
   local w = launchWait[id]
   if not w or w.phase ~= 'settle' then return false end
+  w.lastBodyMps = tonumber(bodyMps)
   local ahead = w.aheadM
   local o = objectById(id)
   if o then
@@ -2671,15 +2856,15 @@ local function launchRespawned(now)
     if type(t) == 'table' and t.isAi ~= false then
       local rc = tonumber(t.respawnCount)
       if rc and launchCount[id] and rc > launchCount[id] then
-        launchCount[id] = rc
+        local o0 = objectById(id)
+        refreshBeforeCloak(id, t, o0, true)
+        launchCount[id] = tonumber(t.respawnCount) or rc
         conflictCache[id] = nil   -- a new respawn is a new position: always look afresh
         if M.cachedConflict(conflictCache, id, now, M.CONFLICT_CACHE_S, spawnConflict) then
           conflictCache[id] = nil
           stats.conflictRespawns = (stats.conflictRespawns or 0) + 1
           recycleBehind(id, t, now)
         elseif not launchWait[id] then
-          local o0 = objectById(id)
-          cloakPreRoll(t, o0)
           local a0 = nil
           local ok0, got0 = pcall(aheadMeters, o0)
           if ok0 and type(got0) == 'number' then a0 = got0 end
@@ -2688,6 +2873,8 @@ local function launchRespawned(now)
             minAheadM = (a0 and a0 > 40) and M.UNCLOAK_MIN_M or nil, target = nil,
           }
         end
+      elseif t.state == 'reset' then
+        refreshBeforeCloak(id, t, objectById(id), false)
       end
       launchCount[id] = tonumber(t.respawnCount) or rc
       local w = launchWait[id]
@@ -2717,7 +2904,7 @@ local function launchRespawned(now)
         elseif w.phase == 'impulse' and now >= (w.nextAt or 0) then
           local v = roadLaunchSpeed(id)
           if not v then
-            if w.minAheadM then
+            if w.minAheadM or badFastUncloak(id, o, w) then
               recycleBehind(id, t, now)
             else
               uncloakFade(id, t)
@@ -2729,7 +2916,7 @@ local function launchRespawned(now)
             queueMotion(o, string.format('beamngEarth_spawnMotion.launchAtSpeed(%.3f, %d)', v, id))
           end
         elseif w.phase == 'settle' and now >= (w.expires or 0) then
-          if w.minAheadM then
+          if w.minAheadM or badFastUncloak(id, o, w) then
             recycleBehind(id, t, now)
           else
             uncloakFade(id, t)
@@ -2737,7 +2924,7 @@ local function launchRespawned(now)
         elseif w.phase == 'settle' then
           queueMotion(o, string.format('beamngEarth_spawnMotion.probeSettle(%.3f, %d)', w.target or 0, id))
         elseif now >= (w.expires or math.huge) then
-          if w.minAheadM then
+          if w.minAheadM or badFastUncloak(id, o, w) then
             recycleBehind(id, t, now)
           else
             uncloakFade(id, t)

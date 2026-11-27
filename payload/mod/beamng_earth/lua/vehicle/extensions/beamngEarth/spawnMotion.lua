@@ -176,10 +176,109 @@ local function findGearbox()
   end
 end
 
+local function syncShiftLogic(gb, modeStr)
+  local mc = controller and controller.mainController or nil
+  if type(mc) ~= "table" then return end
+  if type(mc.setFreeze) == "function" then
+    pcall(mc.setFreeze, 0)
+  end
+  if type(mc.setState) ~= "function" then return end
+  local gtype = type(gb) == "table" and gb.type or nil
+  local hasMode = gtype == "dctGearbox" or gtype == "automaticGearbox" or gtype == "cvtGearbox"
+  if not hasMode and type(mc.getState) == "function" then
+    local ok, st = pcall(mc.getState)
+    hasMode = ok and type(st) == "table" and st.grb_mde ~= nil
+  end
+  -- Update automaticHandling.mode directly via setState({ grb_mde = ... }) so arcade
+  -- shiftLogic never switches into realistic behavior via shiftToGearIndex.
+  if hasMode and type(modeStr) == "string" then
+    pcall(mc.setState, { grb_mde = modeStr })
+  end
+end
+
+local function maxForwardGearIndex(gb)
+  local maxIdx = tonumber(gb.maxGearIndex) or 0
+  if maxIdx < 1 and type(gb.gearRatios) == "table" then
+    for k, v in pairs(gb.gearRatios) do
+      if type(k) == "number" and k >= 1 and k > maxIdx and tonumber(v) and tonumber(v) > 0 then
+        maxIdx = k
+      end
+    end
+  end
+  return maxIdx
+end
+
 local function shiftGear(gb, idx)
-  if type(gb) ~= "table" then return false end
-  if gb.type == "dctGearbox" and type(gb.setGearIndex1) == "function" then
-    return pcall(gb.setGearIndex1, gb, idx)
+  idx = tonumber(idx) or 0
+  if type(gb) ~= "table" then
+    syncShiftLogic(nil, idx <= 0 and "N" or "D")
+    return false
+  end
+  local isDct = gb.type == "dctGearbox"
+  local c1 = type(gb.electricsClutchRatio1Name) == "string" and gb.electricsClutchRatio1Name or "clutchRatio1"
+  local c2 = type(gb.electricsClutchRatio2Name) == "string" and gb.electricsClutchRatio2Name or "clutchRatio2"
+  local maxIdx = maxForwardGearIndex(gb)
+  if idx <= 0 then
+    syncShiftLogic(gb, "N")
+    if type(gb.setMode) == "function" then
+      pcall(gb.setMode, gb, "neutral")
+    end
+    if isDct then
+      if (tonumber(gb.gearIndex1) or 0) < 1 and type(gb.setGearIndex1) == "function" then
+        pcall(gb.setGearIndex1, gb, 1)
+      end
+      if (tonumber(gb.gearIndex2) or 0) < 1 and type(gb.setGearIndex2) == "function" then
+        pcall(gb.setGearIndex2, gb, math.min(2, math.max(1, maxIdx)))
+      end
+      pcall(function() gb.gearIndex = 0 end)
+      if electrics and type(electrics.values) == "table" then
+        electrics.values[c1] = 0
+        electrics.values[c2] = 0
+      end
+      return true
+    end
+    if type(gb.setGearIndex) == "function" then
+      return pcall(gb.setGearIndex, gb, 0, 0)
+    end
+    return true
+  end
+
+  syncShiftLogic(gb, "D")
+  if type(gb.setMode) == "function" then
+    pcall(gb.setMode, gb, "drive")
+  end
+  if isDct and type(gb.setGearIndex1) == "function" then
+    -- BeamNG dctGearbox places odd forward gears on shaft 1 (clutchRatio1) and
+    -- even forward gears on shaft 2 (clutchRatio2). Pre-engage the active shaft's
+    -- clutch and stage a valid adjacent forward gear on the opposite shaft.
+    if idx % 2 == 1 then
+      local evenNeighbor = (idx + 1 <= maxIdx) and (idx + 1) or math.max(2, idx - 1)
+      pcall(gb.setGearIndex1, gb, idx)
+      if type(gb.setGearIndex2) == "function" and evenNeighbor >= 2 and evenNeighbor % 2 == 0 and evenNeighbor <= maxIdx then
+        pcall(gb.setGearIndex2, gb, evenNeighbor)
+      end
+      if electrics and type(electrics.values) == "table" then
+        electrics.values[c1] = 1
+        electrics.values[c2] = 0
+      end
+    else
+      local oddNeighbor = math.max(1, idx - 1)
+      pcall(gb.setGearIndex1, gb, oddNeighbor)
+      if type(gb.setGearIndex2) == "function" then
+        pcall(gb.setGearIndex2, gb, idx)
+      end
+      if electrics and type(electrics.values) == "table" then
+        electrics.values[c1] = 0
+        electrics.values[c2] = 1
+      end
+    end
+    pcall(function()
+      gb.gearIndex = idx
+      if type(gb.gearRatios) == "table" and tonumber(gb.gearRatios[idx]) then
+        gb.gearRatio = tonumber(gb.gearRatios[idx])
+      end
+    end)
+    return true
   end
   if type(gb.setGearIndex) == "function" then
     return pcall(gb.setGearIndex, gb, idx, 0)

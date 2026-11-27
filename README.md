@@ -6,7 +6,7 @@ Fixes highway traffic spawning, lane keeping past exit ramps and merges, long-di
 
 ## What This Fixes
 
-- **Smoother Highway Traffic Spawns:** Spawns oncoming and ahead highway traffic farther down the road already rolling at road speed instead of popping in stopped or skidding right in front of you.
+- **Smoother Highway Traffic Spawns:** Spawns oncoming and ahead traffic farther down divided and curving undivided two-lane highways already rolling in Drive at road speed, and refreshes pooled vehicle AI/roles before uncloaking instead of popping in stopped, reversing, or turning around.
 - **Cleaner Highway Merges & Lane Lines:** Keeps cars centered in their lanes through highway merges and removes tiny broken road stubs that made AI cars swerve or hesitate.
 - **Stays on the Highway Past Exits & Overpasses:** Stops AutoDrive and GPS routing from accidentally jumping onto narrow exit ramps or overpasses crossing above the highway.
 - **Uninterrupted Long-Distance AutoDrive:** Fixes AutoDrive dropping its route or braking every few hundred meters on long drives, and recovers cleanly after pausing or crossing map tile borders.

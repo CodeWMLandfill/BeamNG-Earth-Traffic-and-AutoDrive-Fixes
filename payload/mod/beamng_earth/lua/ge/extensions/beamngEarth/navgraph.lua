@@ -581,13 +581,21 @@ function M.toNodes(g, b, edgeM, leftHand, yieldEvery, halo, fastHalo)
     end
     return false
   end
+  local function hasFastEdge(startId)
+    local root = nodes[startId]
+    if not (root and type(root.links) == 'table') then return false end
+    for _, ed in pairs(root.links) do
+      if (tonumber(ed.speedLimit) or 0) >= M.FAST_HALO_MS then return true end
+    end
+    return false
+  end
   for _, k in ipairs(physCutOrder) do
-    cutList[#cutList + 1] = { keep[k][1], keep[k][2], hasHaloRunway(k) }
+    cutList[#cutList + 1] = { keep[k][1], keep[k][2], hasHaloRunway(k), hasFastEdge(k) }
   end
   for k in pairs(hardDead) do
     if not phys[k] and keep[k] and M.inside(b, keep[k][1], keep[k][2], edgeM - 220) then
       cut[k] = true
-      cutList[#cutList + 1] = { keep[k][1], keep[k][2], false }
+      cutList[#cutList + 1] = { keep[k][1], keep[k][2], false, true }
     end
   end
   -- A clipped-away arm must not turn a junction into an apparent degree-two seam.
@@ -650,9 +658,12 @@ function M.cutReach(sp, fresh, lag)
 end
 
 -- Pure: is a car at (px, py) within m of one of the cuts, whichever way it points?
-function M.nearCut(px, py, list, m)
+-- When hardOnly is true, halo-backed inner cuts (c[3] == true) are ignored.
+function M.nearCut(px, py, list, m, hardOnly)
   for _, c in ipairs(list) do
-    if (c[1] - px) ^ 2 + (c[2] - py) ^ 2 <= m * m then return true end
+    if not (hardOnly and c[3] == true) then
+      if (c[1] - px) ^ 2 + (c[2] - py) ^ 2 <= m * m then return true end
+    end
   end
   return false
 end
@@ -674,9 +685,10 @@ end
 
 -- Pure: is a car at (px, py) moving along unit (dx, dy) heading for one of the cuts within reach m (45 degrees)?
 -- When hardOnly is true, halo-backed inner cuts (c[3] == true) are ignored so only true dead-end cuts match.
-function M.headingToCut(px, py, dx, dy, list, reach, hardOnly)
+-- When fastOnly is true, slow side-street cuts (c[4] == false) are ignored so they cannot hijack fast-road cars.
+function M.headingToCut(px, py, dx, dy, list, reach, hardOnly, fastOnly)
   for _, c in ipairs(list) do
-    if not (hardOnly and c[3] == true) then
+    if not (hardOnly and c[3] == true) and not (fastOnly and c[4] == false) then
       local vx, vy = c[1] - px, c[2] - py
       local d = math.sqrt(vx * vx + vy * vy)
       if d <= reach and (d < 1 or (vx * dx + vy * dy) >= 0.7071 * d) then return true end
@@ -1221,6 +1233,58 @@ function M.hasHighwayRunway(nodes, startEdge, cx, cy, alongOut, minRunwayM, cuts
   return acc >= minRunwayM
 end
 
+-- Pure: true when at least `minRunwayM` of connected drivable edges (any road class) continue forward from `(cx, cy)`
+-- along `startEdge` in direction `alongOut`. Prevents unrelated adjacent clipped side-streets from yanking a flowing car.
+function M.hasForwardRunway(nodes, startEdge, cx, cy, alongOut, minRunwayM)
+  minRunwayM = tonumber(minRunwayM) or 120
+  if minRunwayM <= 0 then return true end
+  if type(nodes) ~= 'table' or type(startEdge) ~= 'table' then return false end
+  if startEdge.oneWay and not alongOut then return false end
+  if type(startEdge.lanes) == 'string' and sameWayCount(startEdge.lanes, alongOut) < 1 then return false end
+  local ix, iy, _iz, ox, oy, _oz, ex, ey = edgeGeom(startEdge)
+  if not ix then return false end
+  local destx, desty, curHx, curHy, destName
+  if alongOut then
+    destx, desty, curHx, curHy, destName = ox, oy, ex, ey, startEdge.outNode
+  else
+    destx, desty, curHx, curHy, destName = ix, iy, -ex, -ey, startEdge.inNode
+  end
+  local acc = math.sqrt((destx - cx) ^ 2 + (desty - cy) ^ 2)
+  if acc >= minRunwayM then return true end
+  local visited = { [startEdge] = true }
+  local steps = 0
+  while destName and acc < minRunwayM and steps < 24 do
+    steps = steps + 1
+    local nd = nodes[destName]
+    if not (nd and type(nd.links) == 'table') then break end
+    local bestE, bestDot, bestLen, bestHx, bestHy, bestDest = nil, 0.35, 0, 0, 0, nil
+    for _, e2 in pairs(nd.links) do
+      if not visited[e2] then
+        local nix, niy, _niz, nox, noy, _noz, nex, ney, nel = edgeGeom(e2)
+        if nix then
+          local toward2 = e2.inNode == destName
+          if not (e2.oneWay and not toward2)
+              and (type(e2.lanes) ~= 'string' or sameWayCount(e2.lanes, toward2) >= 1) then
+            local hx2, hy2 = nex, ney
+            if not toward2 then hx2, hy2 = -nex, -ney end
+            local cdot = hx2 * curHx + hy2 * curHy
+            if cdot > bestDot then
+              bestE, bestDot, bestLen = e2, cdot, nel
+              bestHx, bestHy = hx2, hy2
+              bestDest = toward2 and e2.outNode or e2.inNode
+            end
+          end
+        end
+      end
+    end
+    if not bestE then break end
+    visited[bestE] = true
+    acc = acc + bestLen
+    curHx, curHy, destName = bestHx, bestHy, bestDest
+  end
+  return acc >= minRunwayM
+end
+
 -- Pure: a lane-centred pose on the highway ahead of the player, or nil when the corridor
 -- is full, the block is too short, or every spot is blocked. Does not teleport; the guard
 -- places the pose and cloaks the car. platoonSlot 0 is the lead. A later slot sits
@@ -1624,9 +1688,8 @@ local function cloakPreRoll(t, o)
 end
 
 -- Stock gameplay/traffic.lua calls veh:onRefresh() inside doTraffic() ONLY when veh.state == 'reset'.
--- Cloaking a respawn immediately sets t.state = 'preRoll', which otherwise skips onRefresh() forever
--- (leaving stale AI routes that reverse/3-point-turn and permanent post-crash follow/chase roles).
-local function refreshBeforeCloak(id, t, o, force)
+-- Refresh role/AI state without cloaking (used for initial spawns or non-cloaked resets).
+local function refreshTrafficState(id, t, o, force)
   o = o or (id and objectById(id)) or nil
   if type(t) == 'table' then
     local roleDirty = type(t.role) == 'table' and t.role.state ~= nil and t.role.state ~= 'none'
@@ -1650,6 +1713,13 @@ local function refreshBeforeCloak(id, t, o, force)
       pcall(o.queueLuaCommand, o, 'if ai then ai.setMode("traffic"); ai.driveInLane("on"); ai.reset() end')
     end
   end
+end
+
+-- Cloaking a respawn immediately sets t.state = 'preRoll', which otherwise skips onRefresh() forever
+-- (leaving stale AI routes that reverse/3-point-turn and permanent post-crash follow/chase roles).
+local function refreshBeforeCloak(id, t, o, force)
+  o = o or (id and objectById(id)) or nil
+  refreshTrafficState(id, t, o, force)
   cloakPreRoll(t, o)
 end
 M.refreshBeforeCloak = refreshBeforeCloak
@@ -1801,18 +1871,29 @@ function M.highwayHazard(damage, speed, limit, nearJunc, since, now, dist, camVi
   return false
 end
 
-M.SIGHT_SHIELD_S = 0.10
+M.SIGHT_SHIELD_S = 0.0
 M.SIGHT_SHIELD_MIN_M = 450
+M.SIGHT_GRACE_S = 2.5
+M.SIGHT_CLOSE_M = 85
+M.SIGHT_FOV_TAN = 1.15
 
--- Pure: minimum activeRadius (m) to hold on any AI car (including wrecks) that is visible or in the forward corridor
--- inside the terrain block, so stock gameplay/traffic/vehicle.lua tryRespawn() cannot fade or delete a car or wreck in
--- front of the player; nil once behind the camera and out of sight (or reaching the block's guard edge).
-function M.shieldInSight(camVisible, aheadM, sideM, b, x, y, _damage)
-  if not M.inside(b, x, y, M.GUARD_M + 15) then return nil end
+-- Pure: minimum activeRadius (m) to hold on any AI car (including wrecks) that is visible in the camera view cone,
+-- within the close surround bubble (mirrors/bumper), or line-of-sight ahead inside the terrain block guard, so stock
+-- gameplay/traffic/vehicle.lua tryRespawn() cannot fade or delete a car the player can see; nil once behind the camera
+-- and out of sight (or reaching the block's guard edge).
+function M.shieldInSight(camVisible, aheadM, sideM, b, x, y, _damage, tanHalfH)
+  if not M.inside(b, x, y, M.GUARD_M) then return nil end
   local ahead = tonumber(aheadM) or -math.huge
   local side = math.abs(tonumber(sideM) or 0)
-  if camVisible == true or (ahead > -10 and ahead < M.AHEAD_M[2] + 60 and side < 90) then
-    return math.max(M.SIGHT_SHIELD_MIN_M, ahead + 200)
+  local dist = math.sqrt(ahead * ahead + side * side)
+  local maxDist = M.AHEAD_M[2] + 100
+  local halfTan = tonumber(tanHalfH) or M.SIGHT_FOV_TAN
+  if halfTan < M.SIGHT_FOV_TAN then halfTan = M.SIGHT_FOV_TAN end
+  local inClose = dist <= M.SIGHT_CLOSE_M
+  local inCone = ahead > -15 and dist <= maxDist and side <= math.max(90, ahead * halfTan)
+  local inRay = camVisible == true and ahead > -60 and dist <= maxDist
+  if inClose or inCone or inRay then
+    return math.max(M.SIGHT_SHIELD_MIN_M, dist + 200)
   end
   return nil
 end
@@ -1871,11 +1952,42 @@ function M.pickAdaptiveDrop(candidates)
 end
 
 local lastSightShield = -math.huge
-local shielded = {}   -- car id -> record from M.shieldApply, for the cars whose stock respawn radii we raised
+local shielded = {}    -- car id -> record from M.shieldApply, for the cars whose stock respawn radii we raised
+local lastInSight = {} -- car id -> { at = os.clock(), need = r } for brief-glance sight grace
 
 local function roadAt(x, y, z)
   local ok, got = pcall(closestRoad, x, y, z)
   if ok then return got end
+end
+
+local function carHasForwardRunway(p, dx, dy, minRunwayM)
+  local m = map and map.getMap and map.getMap()
+  if not (m and m.nodes and map.findClosestRoad) then return false end
+  local ok, n1, n2 = pcall(map.findClosestRoad, p)
+  if not ok or not (n1 and n2) then return false end
+  local a, c = m.nodes[n1], m.nodes[n2]
+  local e = a and c and (a.links[n2] or c.links[n1])
+  if not e then return false end
+  local ix, iy, _iz, _ox, _oy, _oz, ex, ey = edgeGeom(e)
+  if not ix then return false end
+  local dot = ex * dx + ey * dy
+  if math.abs(dot) < 0.5 then return false end
+  local alongOut = dot >= 0
+  if e.oneWay and not alongOut then return false end
+  return M.hasForwardRunway(m.nodes, e, p.x, p.y, alongOut, minRunwayM)
+end
+
+local function cameraTanHalfH()
+  local fov = core_camera and core_camera.getFovDeg and tonumber(core_camera.getFovDeg()) or 65
+  if not fov or fov ~= fov or fov < 20 or fov > 160 then fov = 65 end
+  local aspect = 16 / 9
+  local io = rawget(_G, 'ui_imgui') and ui_imgui.GetIO and ui_imgui.GetIO() or nil
+  local sz = io and io.DisplaySize or nil
+  if sz and tonumber(sz.x) and tonumber(sz.y) and sz.y > 0 then
+    aspect = math.max(1.2, math.min(3.5, sz.x / sz.y))
+  end
+  local t = math.tan(math.rad(fov) * 0.5) * aspect * 1.15
+  return math.max(M.SIGHT_FOV_TAN, t)
 end
 
 local function camAhead(p, fallback)
@@ -1888,7 +2000,7 @@ local function camAhead(p, fallback)
 end
 
 local function shieldVisibleTraffic(now, b)
-  if now - lastSightShield < M.SIGHT_SHIELD_S then return end
+  if (M.SIGHT_SHIELD_S or 0) > 0 and now - lastSightShield < M.SIGHT_SHIELD_S then return end
   lastSightShield = now
   local gt = gameplay_traffic
   if not (gt and gt.getState and gt.getState() == 'on' and gt.getTrafficData) then return end
@@ -1906,6 +2018,7 @@ local function shieldVisibleTraffic(now, b)
   local fl = math.sqrt(fx * fx + fy * fy)
   if fl < 1e-6 then return end
   fx, fy = fx / fl, fy / fl
+  local tanHalfH = cameraTanHalfH()
   local mapObjs = rawget(_G, 'map') and map.objects or nil
   localplayers.snapshot(controlled)
   local data = gt.getTrafficData() or {}
@@ -1917,10 +2030,23 @@ local function shieldVisibleTraffic(now, b)
       local ahead = dx * fx + dy * fy
       local side = -dx * fy + dy * fx
       local dmg = (mapObjs and mapObjs[id] and tonumber(mapObjs[id].damage)) or tonumber(t.damage) or 0
-      local r = M.shieldInSight(t.camVisible, ahead, side, b, p.x, p.y, dmg)
-      if r and type(t.respawn) == 'table' then
-        local need = math.max(r, (tonumber(t.focusDist) or 0) + 200)
+      local r = M.shieldInSight(t.camVisible, ahead, side, b, p.x, p.y, dmg, tanHalfH)
+      local holdNeed = nil
+      if r then
+        lastInSight[id] = { at = now, need = r }
+        holdNeed = r
+      else
+        local prev = lastInSight[id]
+        if prev and (now - prev.at) < M.SIGHT_GRACE_S and M.inside(b, p.x, p.y, M.GUARD_M) then
+          holdNeed = prev.need
+        else
+          lastInSight[id] = nil
+        end
+      end
+      if holdNeed and type(t.respawn) == 'table' then
+        local need = math.max(holdNeed, (tonumber(t.focusDist) or 0) + 250)
         shielded[id] = M.shieldApply(t.respawn, shielded[id], need)
+        t.respawn.staticVisibility = 1
         if t.state == 'fadeOut' then
           t.state = 'active'
           t.alpha = 1
@@ -1928,13 +2054,18 @@ local function shieldVisibleTraffic(now, b)
           stats.fadeSaves = (stats.fadeSaves or 0) + 1
         end
       elseif shielded[id] then
-        -- behind the camera and out of sight again: stock may recycle it normally
+        -- behind the camera and out of sight past grace: stock may recycle it normally
         shielded[id] = M.shieldApply(t.respawn, shielded[id], nil)
       end
+    else
+      lastInSight[id] = nil
     end
   end
   for id in pairs(shielded) do
     if not data[id] then shielded[id] = nil end
+  end
+  for id in pairs(lastInSight) do
+    if not data[id] then lastInSight[id] = nil end
   end
 end
 
@@ -1990,13 +2121,18 @@ local function guard(b, all, lag)
         if toCut and (M.FAST_HALO_M or 0) > 0 and sp >= 8.0 then
           rd = roadAt(p.x, p.y, p.z)
           if M.skipFastHaloCut(rd and (rd.limit or rd.speedLimit) or 0, sp, b, p.x, p.y)
-              and not (dl > 1e-6 and M.headingToCut(p.x, p.y, dir.x / dl, dir.y / dl, cuts, reach, true)) then
+              and not (dl > 1e-6 and M.headingToCut(p.x, p.y, dir.x / dl, dir.y / dl, cuts, reach, true, true)) then
             toCut = false
           end
         end
+        -- Do not yank a car for a blind cone cut if its own road continues smoothly on the navgraph.
+        if toCut and dl > 1e-6 and M.inside(b, p.x, p.y, M.GUARD_M + 10)
+            and carHasForwardRunway(p, dir.x / dl, dir.y / dl, math.max(120, M.stopReach(sp))) then
+          toCut = false
+        end
         -- at the cut already (GitHub #855): stopped at the dead end or turning round, which no longer heads for it
         local atCut = false
-        if not toCut and not fresh and not paused and M.nearCut(p.x, p.y, cuts, M.CUT_NEAR_M) then
+        if not toCut and not fresh and not paused and M.nearCut(p.x, p.y, cuts, M.CUT_NEAR_M, true) then
           local f = o:getDirectionVector()
           local fl = math.sqrt(f.x * f.x + f.y * f.y)
           local fwd = u.x * f.x + u.y * f.y
@@ -2005,7 +2141,7 @@ local function guard(b, all, lag)
           elseif fl > 1e-6 then hx, hy = f.x / fl, f.y / fl end
           local r = hx and closestRoad(p.x, p.y, p.z) or nil
           local roadDot = r and (r.dx * hx + r.dy * hy) or nil
-          local facingCut = fl > 1e-6 and M.headingToCut(p.x, p.y, f.x / fl, f.y / fl, cuts, M.CUT_NEAR_M) or false
+          local facingCut = fl > 1e-6 and M.headingToCut(p.x, p.y, f.x / fl, f.y / fl, cuts, M.CUT_NEAR_M, true) or false
           atCut = M.cutStopped(sp, fwd, roadDot, r and r.oneWay or nil, facingCut)
         end
         if not paused and o:getVelocity():length() < M.STUCK_MS then
@@ -2045,7 +2181,9 @@ local function guard(b, all, lag)
             end
           end
         end
-        if all or urgent or isHaz or badCloak or (not underCooldown and (toCut or atCut or M.stuck(stillSince[id], now, d))) then
+        local inSight = lastInSight[id] ~= nil and (now - lastInSight[id].at) < M.SIGHT_GRACE_S
+        local isStuck = M.stuck(stillSince[id], now, d) and not (inSight and d < 120)
+        if all or urgent or isHaz or badCloak or (not underCooldown and (toCut or atCut or isStuck)) then
           if toCut then stats.cutRespawns = (stats.cutRespawns or 0) + 1
           elseif atCut then stats.cutStopRespawns = (stats.cutStopRespawns or 0) + 1 end
           if isHaz then stats.wreckRespawns = (stats.wreckRespawns or 0) + 1 end
@@ -2840,6 +2978,7 @@ end
 
 -- Every LAUNCH_SCAN_S: a new respawn is cloaked in preRoll, brakes released, then launched
 -- on one graphics dt. It fades in only after onLaunchReport says the drivetrain has settled.
+local orphanPreRoll = {}
 local function launchRespawned(now)
   local gt = gameplay_traffic
   if not M.LAUNCH or not gt or not gt.getState or gt.getState() ~= 'on' or now - lastLaunchScan < M.LAUNCH_SCAN_S then
@@ -2848,6 +2987,13 @@ local function launchRespawned(now)
   lastLaunchScan = now
   if simTimeAuthority and simTimeAuthority.getPause and simTimeAuthority.getPause() then return end
   localplayers.snapshot(controlled)
+  local psp = 0
+  local me = playerId()
+  local pv = me >= 0 and objectById(me) or nil
+  if pv and pv.getVelocity then
+    local pu = pv:getVelocity()
+    if pu and pu.x and pu.y then psp = math.sqrt(pu.x * pu.x + pu.y * pu.y) end
+  end
   local data = gt.getTrafficData() or {}
   for id in pairs(conflictCache) do
     if not data[id] then conflictCache[id] = nil end
@@ -2855,31 +3001,46 @@ local function launchRespawned(now)
   for id, t in pairs(data) do
     if type(t) == 'table' and t.isAi ~= false then
       local rc = tonumber(t.respawnCount)
-      if rc and launchCount[id] and rc > launchCount[id] then
+      local recycledNow = false
+      local isRespawn = rc and ((launchCount[id] and rc > launchCount[id])
+        or (not launchCount[id] and rc > 0 and t.state == 'reset'))
+      if isRespawn then
         local o0 = objectById(id)
         refreshBeforeCloak(id, t, o0, true)
-        launchCount[id] = tonumber(t.respawnCount) or rc
+        local rcAfterRefresh = tonumber(t.respawnCount) or rc
+        launchCount[id] = rcAfterRefresh
         conflictCache[id] = nil   -- a new respawn is a new position: always look afresh
         if M.cachedConflict(conflictCache, id, now, M.CONFLICT_CACHE_S, spawnConflict) then
           conflictCache[id] = nil
           stats.conflictRespawns = (stats.conflictRespawns or 0) + 1
           recycleBehind(id, t, now)
+          recycledNow = true
+          if tonumber(t.respawnCount) == rcAfterRefresh then
+            launchWait[id] = {
+              phase = 'prep', nextAt = now + 0.06, expires = now + 0.2 + M.CLOAK_MAX_S,
+              minAheadM = nil, target = nil,
+            }
+          end
         elseif not launchWait[id] then
           local a0 = nil
           local ok0, got0 = pcall(aheadMeters, o0)
           if ok0 and type(got0) == 'number' then a0 = got0 end
           launchWait[id] = {
             phase = 'prep', nextAt = now + 0.06, expires = now + 0.2 + M.CLOAK_MAX_S,
-            minAheadM = (a0 and a0 > 40) and M.UNCLOAK_MIN_M or nil, target = nil,
+            minAheadM = (psp >= M.AHEAD_MS and a0 and a0 > 40) and M.UNCLOAK_MIN_M or nil, target = nil,
           }
         end
       elseif t.state == 'reset' then
-        refreshBeforeCloak(id, t, objectById(id), false)
+        -- Initial spawn or non-respawnCount reset: refresh AI/roles without cloaking so the car stays visible.
+        refreshTrafficState(id, t, objectById(id), false)
+        launchCount[id] = tonumber(t.respawnCount) or rc
+      else
+        launchCount[id] = tonumber(t.respawnCount) or rc
       end
-      launchCount[id] = tonumber(t.respawnCount) or rc
       local w = launchWait[id]
       local o = w and objectById(id) or nil
       if w and o then
+        orphanPreRoll[id] = nil
         local ahead = nil
         local okA, got = pcall(aheadMeters, o)
         if okA and type(got) == 'number' then ahead = got end
@@ -2930,11 +3091,27 @@ local function launchRespawned(now)
             uncloakFade(id, t)
           end
         end
+      elseif not recycledNow and t.state == 'preRoll' then
+        -- Self-heal any orphaned preRoll vehicle so no car can stay permanently invisible.
+        orphanPreRoll[id] = orphanPreRoll[id] or now
+        if now - orphanPreRoll[id] >= M.CLOAK_MAX_S + 0.5 then
+          orphanPreRoll[id] = nil
+          if badFastUncloak(id, objectById(id), nil) then
+            recycleBehind(id, t, now)
+          else
+            uncloakFade(id, t)
+          end
+        end
+      else
+        orphanPreRoll[id] = nil
       end
     end
   end
   for wid in pairs(launchCount) do
-    if data[wid] == nil then launchCount[wid], launchWait[wid] = nil, nil end
+    if data[wid] == nil then launchCount[wid], launchWait[wid], orphanPreRoll[wid] = nil, nil, nil end
+  end
+  for wid in pairs(orphanPreRoll) do
+    if data[wid] == nil then orphanPreRoll[wid] = nil end
   end
 end
 
@@ -3095,6 +3272,8 @@ function M.reset()
   nextPlatoonSlot, lastPlatoonAt = 0, -math.huge
   lastSightShield = -math.huge
   shielded = {}
+  lastInSight = {}
+  orphanPreRoll = {}
   conflictCache = {}
   overtake.reset()
   pendingSignals = nil

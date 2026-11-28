@@ -582,6 +582,19 @@ function M.launchAtSpeed(targetMps, objectId)
     gearIdx, engAV = M.pickGear(gb.gearRatios, downstream, meanWheelRadius() or 0.2,
       targetMps, 140, 440)
     if gearIdx then shiftGear(gb, gearIdx) end
+  else
+    -- Restore Drive after prepLaunch()'s Neutral on EVs (no gearbox device) or unresolved drivetrains.
+    syncShiftLogic(gb, "D")
+    if not gb and powertrain and type(powertrain.getDevicesByType) == "function" then
+      local motors = powertrain.getDevicesByType("electricMotor")
+      if type(motors) == "table" then
+        for _, motor in pairs(motors) do
+          if type(motor) == "table" and motor.motorDirection ~= nil then
+            pcall(function() motor.motorDirection = 1 end)
+          end
+        end
+      end
+    end
   end
   local eng = findEngine()
   if eng and engAV then
